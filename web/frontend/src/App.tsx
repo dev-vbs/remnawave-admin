@@ -149,7 +149,6 @@ export default function App() {
                         <Route path="/bedolaga/marketing" element={<BedolagaMarketing />} />
                         <Route path="/bedolaga/referrals" element={<BedolagaReferrals />} />
                         <Route path="/settings" element={<Settings />} />
-                        <Route path="*" element={<NotFound />} />
                       </Routes>
                     </Suspense>
                   </Layout>
