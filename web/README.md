@@ -83,10 +83,14 @@ docker compose up -d
 
 Caddy автоматически получает SSL сертификаты от Let's Encrypt.
 
-Создайте файл `Caddyfile`:
+#### Стандартный режим (всё в одном контейнере) — используйте по умолчанию
+
+> **Это конфигурация для обычной установки.** Если вы запускаете админку обычным
+> `docker compose --profile web up -d` (без отдельного collector-контейнера) — используйте
+> именно этот Caddyfile. При обновлении версии Caddyfile менять НЕ нужно.
 
 ```caddyfile
-admin.yourdomain.com {
+admin.example.com {
     # Frontend
     handle {
         reverse_proxy web-frontend:80
@@ -94,17 +98,61 @@ admin.yourdomain.com {
 
     # Backend API
     handle /api/* {
-        reverse_proxy web-backend:8081
+        reverse_proxy web-backend:8081 {
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+        }
     }
 
-    # WebSocket (браузер — реалтайм обновления)
+    # WebSocket (браузер + node-agent)
     handle /ws/* {
         reverse_proxy web-backend:8081
     }
+}
+```
 
-    # WebSocket (node-agent — связь с нодами)
-    handle /api/v2/agent/ws {
-        reverse_proxy web-backend:8081
+#### Split-режим (collector отдельно, для высоких нагрузок) — ОПЦИОНАЛЬНО
+
+> ⚠️ **Используйте этот вариант ТОЛЬКО если вы реально подняли отдельный collector-контейнер**
+> (`APP_MODE=api` в `.env` + `docker compose --profile collector up -d`). Порт API при этом
+> меняется на `8082`, а collector-эндпоинты обслуживает контейнер `web-collector:8081`.
+>
+> Если вы НЕ настраивали split — НЕ берите этот Caddyfile: ссылки на `web-backend:8082`
+> и `web-collector` приведут к `502 Bad Gateway` (контейнера `web-collector` нет, а backend
+> в обычном режиме слушает `8081`). Это типичная ошибка при обновлении — используйте
+> «Стандартный режим» выше.
+
+При использовании `APP_MODE=api` + `docker compose --profile collector up -d`:
+
+```caddyfile
+admin.example.com {
+    # Collector (агенты шлют батчи сюда — порт 8081)
+    handle /api/v2/collector/* {
+        reverse_proxy web-collector:8081 {
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+        }
+    }
+
+    # Backend API (админка — порт 8082)
+    handle /api/* {
+        reverse_proxy web-backend:8082 {
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+        }
+    }
+
+    # WebSocket (браузер + node-agent)
+    handle /ws/* {
+        reverse_proxy web-backend:8082
+    }
+
+    # Frontend
+    handle {
+        reverse_proxy web-frontend:80
     }
 }
 ```
