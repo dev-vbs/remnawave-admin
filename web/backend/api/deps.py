@@ -1,5 +1,6 @@
 """API dependencies for web panel."""
 import functools
+import ipaddress
 import logging
 from dataclasses import dataclass, field
 from typing import Optional, List, Tuple, Set
@@ -10,9 +11,12 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from web.backend.core.config import get_web_settings
 from web.backend.core.security import decode_token
 from web.backend.core.token_blacklist import token_blacklist
+from shared.db_schema import ADMIN_TABLE
+from shared.db_query import insert_sql
 
 logger = logging.getLogger(__name__)
-security = HTTPBearer()
+# auto_error=False: при отсутствии Authorization пробуем cookie-аутентификацию
+security = HTTPBearer(auto_error=False)
 
 
 @dataclass
@@ -25,6 +29,7 @@ class AdminUser:
     role_id: Optional[int] = None
     auth_method: str = "telegram"
     account_id: Optional[int] = None
+    unrestricted_user_access: bool = False
     permissions: Set[Tuple[str, str]] = field(default_factory=set)
 
     def has_permission(self, resource: str, action: str) -> bool:
@@ -69,10 +74,11 @@ async def _resolve_password_admin(username: str, settings) -> AdminUser:
             return AdminUser(
                 telegram_id=account.get("telegram_id"),
                 username=account["username"],
-                role=account.get("role_name", "admin"),
+                role=account.get("role_name") or "admin",
                 role_id=account.get("role_id"),
                 auth_method="password",
                 account_id=account["id"],
+                unrestricted_user_access=account.get("unrestricted_user_access", False) or False,
                 permissions=perms,
             )
     except HTTPException:
@@ -125,10 +131,11 @@ async def _resolve_telegram_admin(subject: str, payload: dict, settings) -> Admi
             return AdminUser(
                 telegram_id=telegram_id,
                 username=account["username"],
-                role=account.get("role_name", "admin"),
+                role=account.get("role_name") or "admin",
                 role_id=account.get("role_id"),
                 auth_method="telegram",
                 account_id=account["id"],
+                unrestricted_user_access=account.get("unrestricted_user_access", False) or False,
                 permissions=perms,
             )
     except HTTPException:
@@ -147,13 +154,13 @@ async def _resolve_telegram_admin(subject: str, payload: dict, settings) -> Admi
                 username = payload.get("username", f"admin_{telegram_id}")
                 async with db_service.acquire() as conn:
                     account = await conn.fetchrow(
-                        """
-                        INSERT INTO admin_accounts (username, telegram_id, role_id, is_active)
-                        VALUES ($1, $2, $3, true)
-                        ON CONFLICT (telegram_id) DO UPDATE SET
-                            username = EXCLUDED.username
-                        RETURNING *
-                        """,
+                        insert_sql(
+                            ADMIN_TABLE,
+                            ["username", "telegram_id", "role_id", "is_active"],
+                            values="$1, $2, $3, true",
+                            suffix="ON CONFLICT (telegram_id) DO UPDATE SET username = EXCLUDED.username",
+                            returning="*",
+                        ),
                         username, telegram_id, role["id"],
                     )
                 if account:
@@ -176,6 +183,7 @@ async def _resolve_telegram_admin(subject: str, payload: dict, settings) -> Admi
                         role_id=actual_role_id,
                         auth_method="telegram",
                         account_id=account["id"],
+                        unrestricted_user_access=account.get("unrestricted_user_access", False) or False,
                         permissions=perms,
                     )
         except Exception as e:
@@ -197,10 +205,34 @@ async def _resolve_telegram_admin(subject: str, payload: dict, settings) -> Admi
 
 
 async def get_current_admin(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ) -> AdminUser:
-    """Dependency for verifying admin authentication."""
-    token = credentials.credentials
+    """Dependency for verifying admin authentication.
+
+    Источники токена (по приоритету):
+    1. Authorization: Bearer — API-клиенты, мобильное приложение
+    2. HttpOnly cookie rw_access — веб-фронт; мутирующие методы требуют
+       X-CSRF-Token (double-submit, см. core/auth_cookies.py)
+    """
+    from web.backend.core.auth_cookies import ACCESS_COOKIE, csrf_check_passed
+
+    token: Optional[str] = credentials.credentials if credentials else None
+
+    if token is None:
+        token = request.cookies.get(ACCESS_COOKIE)
+        if token and not csrf_check_passed(request):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="CSRF token missing or invalid",
+            )
+
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
     if token_blacklist.is_blacklisted(token):
         raise HTTPException(
@@ -221,9 +253,19 @@ async def get_current_admin(
 
 
 async def get_2fa_temp_admin(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ) -> AdminUser:
-    """Dependency for endpoints that accept a 2FA temp token."""
+    """Dependency for endpoints that accept a 2FA temp token.
+
+    Temp-токен короткоживущий (5 мин) и передаётся только через
+    Authorization header — cookie-механизм к нему не применяется.
+    """
+    if credentials is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     token = credentials.credentials
 
     if token_blacklist.is_blacklisted(token):
@@ -244,11 +286,58 @@ async def get_2fa_temp_admin(
     return await _validate_token_payload(payload)
 
 
+# Маркер-подпротокол для передачи JWT в WebSocket-handshake:
+# клиент шлёт Sec-WebSocket-Protocol: "access-token, <jwt>".
+WS_AUTH_SUBPROTOCOL = "access-token"
+
+
+def extract_ws_token(websocket: WebSocket) -> Tuple[Optional[str], Optional[str]]:
+    """Extract JWT from a WebSocket handshake.
+
+    Источники (по приоритету):
+    1. Sec-WebSocket-Protocol ("access-token, <jwt>") — токен не попадает
+       в access-логи прокси/сервера в отличие от query string.
+    2. HttpOnly cookie rw_access — веб-фронт на cookie-аутентификации
+       (браузер шлёт cookie при handshake автоматически; CSRF-риска нет —
+       сервер только пушит события, мутаций по WS не делает).
+    3. ?token= query param — deprecated, для старых клиентов
+       (мобильное приложение обновляется отдельно).
+
+    Returns (token, subprotocol): subprotocol нужно передать в
+    websocket.accept(subprotocol=...) — браузер разрывает соединение,
+    если сервер не подтвердил запрошенный подпротокол.
+    """
+    from web.backend.core.auth_cookies import ACCESS_COOKIE
+
+    proto_header = websocket.headers.get("sec-websocket-protocol", "")
+    if proto_header:
+        parts = [p.strip() for p in proto_header.split(",")]
+        if len(parts) >= 2 and parts[0] == WS_AUTH_SUBPROTOCOL and parts[1]:
+            return parts[1], WS_AUTH_SUBPROTOCOL
+
+    cookie_token = websocket.cookies.get(ACCESS_COOKIE)
+    if cookie_token:
+        return cookie_token, None
+
+    return websocket.query_params.get("token"), None
+
+
 async def get_current_admin_ws(
     websocket: WebSocket,
-    token: Optional[str] = Query(None),
+    token: Optional[str] = None,
 ) -> AdminUser:
-    """Dependency for verifying admin authentication in WebSocket."""
+    """Dependency for verifying admin authentication in WebSocket.
+
+    Если token не передан явно, извлекается из handshake (см. extract_ws_token).
+    Сохраняет websocket.state.auth_subprotocol — эндпоинт ОБЯЗАН передать его
+    в websocket.accept(subprotocol=...).
+    """
+    if token is None:
+        token, subprotocol = extract_ws_token(websocket)
+        websocket.state.auth_subprotocol = subprotocol
+    else:
+        websocket.state.auth_subprotocol = None
+
     if not token:
         await websocket.close(code=4001, reason="Missing token")
         raise HTTPException(status_code=401, detail="Missing token")
@@ -272,15 +361,14 @@ async def get_current_admin_ws(
 
 
 async def get_optional_admin(
+    request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(
         HTTPBearer(auto_error=False)
     ),
 ) -> Optional[AdminUser]:
     """Optional admin authentication (doesn't fail if not authenticated)."""
-    if not credentials:
-        return None
     try:
-        return await get_current_admin(credentials)
+        return await get_current_admin(request, credentials)
     except HTTPException:
         return None
 
@@ -366,33 +454,96 @@ def require_quota(resource: str):
             return
 
         from web.backend.core.rbac import check_quota
+        from web.backend.core.errors import api_error, E
         allowed, error_msg = await check_quota(admin.account_id, resource)
         if not allowed:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=error_msg,
-            )
+            # Map resource name to a specific quota error code so the
+            # frontend can show a contextual message.
+            code = {
+                "users": E.USERS_QUOTA_EXCEEDED,
+                "nodes": E.NODES_QUOTA_EXCEEDED,
+                "hosts": E.HOSTS_QUOTA_EXCEEDED,
+            }.get(resource, E.QUOTA_EXCEEDED)
+            raise api_error(status.HTTP_403_FORBIDDEN, code, error_msg)
 
     return _check
 
 
 # ── Utility helpers ─────────────────────────────────────────────
 
-def get_client_ip(request: Request) -> str:
-    """Extract client IP from trusted proxy headers.
+# Forwarding headers are honored only from these proxy ranges when
+# WEB_TRUSTED_PROXIES is not explicitly configured. Mirrors the bundled nginx
+# `set_real_ip_from` (loopback + RFC1918 + IPv6 ULA/link-local).
+_DEFAULT_TRUSTED_PROXY_CIDRS = (
+    "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+    "::1/128", "fc00::/7", "fe80::/10",
+)
 
-    Priority:
-    1. X-Real-IP (set by nginx, most reliable)
-    2. X-Forwarded-For first entry (set by upstream reverse proxy)
-    3. request.client.host (direct connection fallback)
+
+@functools.lru_cache(maxsize=1)
+def _trusted_proxy_networks() -> tuple:
+    """Parse WEB_TRUSTED_PROXIES into networks (cached). Empty → private ranges."""
+    raw = (get_web_settings().trusted_proxies_raw or "").strip()
+    entries = (
+        [e.strip() for e in raw.split(",") if e.strip()]
+        if raw else list(_DEFAULT_TRUSTED_PROXY_CIDRS)
+    )
+    nets = []
+    for entry in entries:
+        try:
+            nets.append(ipaddress.ip_network(entry, strict=False))
+        except ValueError:
+            logger.warning("Invalid WEB_TRUSTED_PROXIES entry ignored: %s", entry)
+    return tuple(nets)
+
+
+def _parse_ip(value: str):
+    try:
+        return ipaddress.ip_address(value)
+    except ValueError:
+        return None
+
+
+def _is_trusted_proxy(value: str) -> bool:
+    addr = _parse_ip(value)
+    if addr is None:
+        return False
+    return any(addr in net for net in _trusted_proxy_networks())
+
+
+def get_client_ip(request: Request) -> str:
+    """Resolve the real client IP, trusting proxy headers only from trusted proxies.
+
+    X-Real-IP / X-Forwarded-For are attacker-controllable, so they are honored
+    ONLY when the immediate peer (``request.client.host``) is a configured
+    trusted reverse proxy (``WEB_TRUSTED_PROXIES``). When the connection comes
+    straight to the backend port (e.g. the published collector port) the raw
+    socket address is used instead — a client cannot spoof its IP to bypass the
+    IP whitelist, the brute-force lockout, or fail2ban.
+
+    When the peer is trusted, priority is:
+    1. X-Real-IP — the bundled nginx overwrites it with the verified client IP.
+    2. right-most untrusted hop of X-Forwarded-For (skips our own proxies).
+    3. the peer address itself.
     """
-    real_ip = request.headers.get("x-real-ip")
-    if real_ip:
-        return real_ip.strip()
+    peer = request.client.host if request.client else ""
+
+    # Untrusted / direct connection — never trust forwarding headers.
+    if not peer or not _is_trusted_proxy(peer):
+        return peer or "unknown"
+
+    real_ip = request.headers.get("x-real-ip", "").strip()
+    if real_ip and _parse_ip(real_ip) is not None:
+        return real_ip
+
     forwarded = request.headers.get("x-forwarded-for")
     if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
+        for hop in reversed([h.strip() for h in forwarded.split(",") if h.strip()]):
+            if _parse_ip(hop) is None or _is_trusted_proxy(hop):
+                continue
+            return hop
+
+    return peer
 
 
 async def get_db():
@@ -405,3 +556,25 @@ async def get_api_client():
     """Dependency for API client access."""
     from shared.api_client import api_client
     return api_client
+
+
+INTERNAL_API_SECRET_HEADER = "X-Internal-Api-Secret"
+
+
+async def verify_internal_api_secret(request: Request) -> None:
+    """Dependency to verify internal API secret for bot→backend communication.
+
+    Reads the X-Internal-Api-Secret header and compares it with the
+    INTERNAL_API_SECRET environment variable. Both bot and backend
+    share the same .env file, so this works without a chicken-egg problem.
+    """
+    import os
+    expected = os.environ.get("INTERNAL_API_SECRET", "")
+    if not expected:
+        logger.warning("INTERNAL_API_SECRET not set, rejecting internal request")
+        raise HTTPException(status_code=500, detail="INTERNAL_API_SECRET not configured")
+    received = request.headers.get(INTERNAL_API_SECRET_HEADER, "")
+    if not received or received != expected:
+        logger.warning("Invalid INTERNAL_API_SECRET from %s", request.client.host if request.client else "unknown")
+        raise HTTPException(status_code=401, detail="Invalid internal API secret")
+    logger.debug("Internal API request verified from %s", request.client.host if request.client else "unknown")

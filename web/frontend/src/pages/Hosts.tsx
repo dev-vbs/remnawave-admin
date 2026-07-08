@@ -17,7 +17,7 @@ import {
   Lock,
   ShieldCheck,
   Plus,
-} from 'lucide-react'
+} from '@/components/brand/icons'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Card, CardContent } from '@/components/ui/card'
@@ -49,6 +49,10 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { cn } from '@/lib/utils'
 import { ConfirmDialog } from '@/components/ConfirmDialog'
 import client from '../api/client'
+import { ViewToggle } from '@/components/ViewToggle'
+import { useViewMode } from '@/lib/useViewMode'
+import { HostsTable } from '@/components/hosts/HostsTable'
+import { HostCompactCard } from '@/components/hosts/HostCompactCard'
 
 // Types matching backend HostListItem
 interface Host {
@@ -70,6 +74,10 @@ interface Host {
   security: string | null
   alpn: string | null
   fingerprint: string | null
+  tags: string[] | null
+  mihomo_ip_version: string | null
+  pinned_peer_cert_sha256: string | null
+  verify_peer_cert_by_name: boolean
   shuffle_host: boolean
   mihomo_x25519: string | null
   nodes: { uuid: string; name: string }[] | null
@@ -99,6 +107,9 @@ interface HostEditFormData {
   alpn: string
   fingerprint: string
   tag: string
+  mihomo_ip_version: string
+  pinned_peer_cert_sha256: string
+  verify_peer_cert_by_name: boolean
   server_description: string
   is_hidden: boolean
 }
@@ -131,7 +142,10 @@ function HostEditModal({
     security: host.security_layer || host.security || 'none',
     alpn: host.alpn || '',
     fingerprint: host.fingerprint || '',
-    tag: host.tag || '',
+    tag: (host.tags || []).join(', '),
+    mihomo_ip_version: host.mihomo_ip_version || '',
+    pinned_peer_cert_sha256: host.pinned_peer_cert_sha256 || '',
+    verify_peer_cert_by_name: host.verify_peer_cert_by_name || false,
     server_description: host.server_description || '',
     is_hidden: host.is_hidden || false,
   })
@@ -147,7 +161,10 @@ function HostEditModal({
       security: host.security_layer || host.security || 'none',
       alpn: host.alpn || '',
       fingerprint: host.fingerprint || '',
-      tag: host.tag || '',
+      tag: (host.tags || []).join(', '),
+      mihomo_ip_version: host.mihomo_ip_version || '',
+      pinned_peer_cert_sha256: host.pinned_peer_cert_sha256 || '',
+      verify_peer_cert_by_name: host.verify_peer_cert_by_name || false,
       server_description: host.server_description || '',
       is_hidden: host.is_hidden || false,
     })
@@ -166,7 +183,11 @@ function HostEditModal({
     if (form.security !== curSecurity) updateData.security_layer = form.security
     if (form.alpn !== (host.alpn || '')) updateData.alpn = form.alpn || null
     if (form.fingerprint !== (host.fingerprint || '')) updateData.fingerprint = form.fingerprint || null
-    if (form.tag !== (host.tag || '')) updateData.tag = form.tag || null
+    const curTags = (host.tags || []).join(', ')
+    if (form.tag !== curTags) updateData.tags = form.tag ? form.tag.split(',').map((s) => s.trim()).filter(Boolean) : null
+    if (form.mihomo_ip_version !== (host.mihomo_ip_version || '')) updateData.mihomo_ip_version = form.mihomo_ip_version || null
+    if (form.pinned_peer_cert_sha256 !== (host.pinned_peer_cert_sha256 || '')) updateData.pinned_peer_cert_sha256 = form.pinned_peer_cert_sha256 || null
+    if (form.verify_peer_cert_by_name !== (host.verify_peer_cert_by_name || false)) updateData.verify_peer_cert_by_name = form.verify_peer_cert_by_name
     if (form.server_description !== (host.server_description || '')) updateData.server_description = form.server_description || null
     if (form.is_hidden !== (host.is_hidden || false)) updateData.is_hidden = form.is_hidden
 
@@ -233,63 +254,119 @@ function HostEditModal({
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="none">{t('hosts.security.none')}</SelectItem>
-                <SelectItem value="tls">TLS</SelectItem>
-                <SelectItem value="reality">Reality</SelectItem>
-                <SelectItem value="xtls">XTLS</SelectItem>
+                <SelectItem value="tls">{t('hosts.security.tls')}</SelectItem>
+                <SelectItem value="reality">{t('hosts.security.reality')}</SelectItem>
+                <SelectItem value="xtls">{t('hosts.security.xtls')}</SelectItem>
               </SelectContent>
             </Select>
           </div>
 
           <div className="space-y-2">
-            <Label>SNI</Label>
+            <Label>{t('hosts.form.sni')}</Label>
             <Input
               type="text"
               value={form.sni}
               onChange={(e) => setForm({ ...form, sni: e.target.value })}
-              placeholder="Server Name Indication"
+              placeholder={t('hosts.form.sniPlaceholder')}
             />
           </div>
 
           <div className="space-y-2">
-            <Label>Host</Label>
+            <Label>{t('hosts.form.host')}</Label>
             <Input
               type="text"
               value={form.host}
               onChange={(e) => setForm({ ...form, host: e.target.value })}
-              placeholder="Host header"
+              placeholder={t('hosts.form.hostPlaceholder')}
             />
           </div>
 
           <div className="space-y-2">
-            <Label>Path</Label>
+            <Label>{t('hosts.form.path')}</Label>
             <Input
               type="text"
               value={form.path}
               onChange={(e) => setForm({ ...form, path: e.target.value })}
               className="font-mono text-sm"
-              placeholder="/path"
+              placeholder={t('hosts.form.pathPlaceholder')}
             />
           </div>
 
           <div className="space-y-2">
-            <Label>ALPN</Label>
+            <Label>{t('hosts.form.alpn')}</Label>
             <Input
               type="text"
+              list="host-alpn-options"
               value={form.alpn}
               onChange={(e) => setForm({ ...form, alpn: e.target.value })}
-              placeholder="h2,http/1.1"
+              placeholder={t('hosts.form.alpnPlaceholder')}
             />
+            <datalist id="host-alpn-options">
+              <option value="h3,h2,http/1.1" />
+              <option value="h3,h2" />
+              <option value="h2,http/1.1" />
+              <option value="h2" />
+              <option value="h3" />
+              <option value="http/1.1" />
+            </datalist>
           </div>
 
           <div className="space-y-2">
-            <Label>Fingerprint</Label>
+            <Label>{t('hosts.form.fingerprint')}</Label>
             <Input
               type="text"
+              list="host-fp-options"
               value={form.fingerprint}
               onChange={(e) => setForm({ ...form, fingerprint: e.target.value })}
-              placeholder="chrome, firefox, safari..."
+              placeholder={t('hosts.form.fingerprintPlaceholder')}
+            />
+            <datalist id="host-fp-options">
+              <option value="chrome" />
+              <option value="firefox" />
+              <option value="safari" />
+              <option value="ios" />
+              <option value="android" />
+              <option value="edge" />
+              <option value="randomized" />
+              <option value="random" />
+            </datalist>
+          </div>
+
+          <div className="space-y-2">
+            <Label>{t('hosts.form.mihomoIpVersion')}</Label>
+            <select
+              value={form.mihomo_ip_version}
+              onChange={(e) => setForm({ ...form, mihomo_ip_version: e.target.value })}
+              className="flex h-9 w-full rounded-md border border-[var(--glass-border)] bg-[var(--glass-bg)] px-3 py-1 text-sm text-white focus:outline-none focus:ring-1 focus:ring-primary-500"
+            >
+              <option value="">{t('hosts.form.mihomoIpVersionDefault')}</option>
+              <option value="dual">dual</option>
+              <option value="ipv4">ipv4</option>
+              <option value="ipv6">ipv6</option>
+              <option value="ipv4-prefer">ipv4-prefer</option>
+              <option value="ipv6-prefer">ipv6-prefer</option>
+            </select>
+          </div>
+
+          <div className="space-y-2">
+            <Label>{t('hosts.form.pinnedPeerCert')}</Label>
+            <Input
+              type="text"
+              value={form.pinned_peer_cert_sha256}
+              onChange={(e) => setForm({ ...form, pinned_peer_cert_sha256: e.target.value })}
+              placeholder={t('hosts.form.pinnedPeerCertPlaceholder')}
             />
           </div>
+
+          <label className="flex items-center gap-2 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={form.verify_peer_cert_by_name}
+              onChange={(e) => setForm({ ...form, verify_peer_cert_by_name: e.target.checked })}
+              className="rounded border-[var(--glass-border)] accent-primary-500"
+            />
+            <span className="text-sm text-dark-100">{t('hosts.form.verifyPeerCert')}</span>
+          </label>
 
           <div className="space-y-2">
             <Label>{t('hosts.editHost.tag')}</Label>
@@ -369,6 +446,9 @@ function HostCreateModal({
     alpn: '',
     fingerprint: '',
     tag: '',
+    mihomo_ip_version: '',
+    pinned_peer_cert_sha256: '',
+    verify_peer_cert_by_name: false,
     server_description: '',
     is_hidden: false,
   })
@@ -386,7 +466,10 @@ function HostCreateModal({
     if (form.path.trim()) createData.path = form.path.trim()
     if (form.alpn.trim()) createData.alpn = form.alpn.trim()
     if (form.fingerprint.trim()) createData.fingerprint = form.fingerprint.trim()
-    if (form.tag.trim()) createData.tag = form.tag.trim()
+    if (form.tag.trim()) createData.tags = form.tag.split(',').map((s) => s.trim()).filter(Boolean)
+    if (form.mihomo_ip_version) createData.mihomo_ip_version = form.mihomo_ip_version
+    if (form.pinned_peer_cert_sha256.trim()) createData.pinned_peer_cert_sha256 = form.pinned_peer_cert_sha256.trim()
+    if (form.verify_peer_cert_by_name) createData.verify_peer_cert_by_name = true
     if (form.server_description.trim()) createData.server_description = form.server_description.trim()
     if (form.is_hidden) createData.is_hidden = true
     onSave(createData)
@@ -448,63 +531,119 @@ function HostCreateModal({
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="none">{t('hosts.security.none')}</SelectItem>
-                <SelectItem value="tls">TLS</SelectItem>
-                <SelectItem value="reality">Reality</SelectItem>
-                <SelectItem value="xtls">XTLS</SelectItem>
+                <SelectItem value="tls">{t('hosts.security.tls')}</SelectItem>
+                <SelectItem value="reality">{t('hosts.security.reality')}</SelectItem>
+                <SelectItem value="xtls">{t('hosts.security.xtls')}</SelectItem>
               </SelectContent>
             </Select>
           </div>
 
           <div className="space-y-2">
-            <Label>SNI</Label>
+            <Label>{t('hosts.form.sni')}</Label>
             <Input
               type="text"
               value={form.sni}
               onChange={(e) => setForm({ ...form, sni: e.target.value })}
-              placeholder="Server Name Indication"
+              placeholder={t('hosts.form.sniPlaceholder')}
             />
           </div>
 
           <div className="space-y-2">
-            <Label>Host</Label>
+            <Label>{t('hosts.form.host')}</Label>
             <Input
               type="text"
               value={form.host}
               onChange={(e) => setForm({ ...form, host: e.target.value })}
-              placeholder="Host header"
+              placeholder={t('hosts.form.hostPlaceholder')}
             />
           </div>
 
           <div className="space-y-2">
-            <Label>Path</Label>
+            <Label>{t('hosts.form.path')}</Label>
             <Input
               type="text"
               value={form.path}
               onChange={(e) => setForm({ ...form, path: e.target.value })}
               className="font-mono text-sm"
-              placeholder="/path"
+              placeholder={t('hosts.form.pathPlaceholder')}
             />
           </div>
 
           <div className="space-y-2">
-            <Label>ALPN</Label>
+            <Label>{t('hosts.form.alpn')}</Label>
             <Input
               type="text"
+              list="host-alpn-options"
               value={form.alpn}
               onChange={(e) => setForm({ ...form, alpn: e.target.value })}
-              placeholder="h2,http/1.1"
+              placeholder={t('hosts.form.alpnPlaceholder')}
             />
+            <datalist id="host-alpn-options">
+              <option value="h3,h2,http/1.1" />
+              <option value="h3,h2" />
+              <option value="h2,http/1.1" />
+              <option value="h2" />
+              <option value="h3" />
+              <option value="http/1.1" />
+            </datalist>
           </div>
 
           <div className="space-y-2">
-            <Label>Fingerprint</Label>
+            <Label>{t('hosts.form.fingerprint')}</Label>
             <Input
               type="text"
+              list="host-fp-options"
               value={form.fingerprint}
               onChange={(e) => setForm({ ...form, fingerprint: e.target.value })}
-              placeholder="chrome, firefox, safari..."
+              placeholder={t('hosts.form.fingerprintPlaceholder')}
+            />
+            <datalist id="host-fp-options">
+              <option value="chrome" />
+              <option value="firefox" />
+              <option value="safari" />
+              <option value="ios" />
+              <option value="android" />
+              <option value="edge" />
+              <option value="randomized" />
+              <option value="random" />
+            </datalist>
+          </div>
+
+          <div className="space-y-2">
+            <Label>{t('hosts.form.mihomoIpVersion')}</Label>
+            <select
+              value={form.mihomo_ip_version}
+              onChange={(e) => setForm({ ...form, mihomo_ip_version: e.target.value })}
+              className="flex h-9 w-full rounded-md border border-[var(--glass-border)] bg-[var(--glass-bg)] px-3 py-1 text-sm text-white focus:outline-none focus:ring-1 focus:ring-primary-500"
+            >
+              <option value="">{t('hosts.form.mihomoIpVersionDefault')}</option>
+              <option value="dual">dual</option>
+              <option value="ipv4">ipv4</option>
+              <option value="ipv6">ipv6</option>
+              <option value="ipv4-prefer">ipv4-prefer</option>
+              <option value="ipv6-prefer">ipv6-prefer</option>
+            </select>
+          </div>
+
+          <div className="space-y-2">
+            <Label>{t('hosts.form.pinnedPeerCert')}</Label>
+            <Input
+              type="text"
+              value={form.pinned_peer_cert_sha256}
+              onChange={(e) => setForm({ ...form, pinned_peer_cert_sha256: e.target.value })}
+              placeholder={t('hosts.form.pinnedPeerCertPlaceholder')}
             />
           </div>
+
+          <label className="flex items-center gap-2 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={form.verify_peer_cert_by_name}
+              onChange={(e) => setForm({ ...form, verify_peer_cert_by_name: e.target.checked })}
+              className="rounded border-[var(--glass-border)] accent-primary-500"
+            />
+            <span className="text-sm text-dark-100">{t('hosts.form.verifyPeerCert')}</span>
+          </label>
 
           <div className="space-y-2">
             <Label>{t('hosts.editHost.tag')}</Label>
@@ -588,10 +727,10 @@ function HostCard({
     const sec = h.security_layer || h.security
     if (!sec) return '-'
     const labels: Record<string, string> = {
-      'tls': 'TLS',
-      'reality': 'Reality',
+      'tls': t('hosts.security.tls'),
+      'reality': t('hosts.security.reality'),
       'none': t('hosts.security.none'),
-      'xtls': 'XTLS',
+      'xtls': t('hosts.security.xtls'),
       'default': t('hosts.security.default'),
     }
     return labels[sec] || sec
@@ -624,8 +763,8 @@ function HostCard({
             <div className="min-w-0">
               <div className="flex items-center gap-1.5">
                 <h3 className="font-semibold text-white truncate">{host.remark || t('hosts.statusNoName')}</h3>
-                {host.tag && (
-                  <span className="text-[10px] font-mono px-1 py-0.5 rounded bg-primary-500/10 text-primary-300 border border-primary-500/20 flex-shrink-0">{host.tag}</span>
+                {host.tags && host.tags.length > 0 && (
+                  <span className="text-[10px] font-mono px-1 py-0.5 rounded bg-primary-500/10 text-primary-300 border border-primary-500/20 flex-shrink-0">{host.tags.join(', ')}</span>
                 )}
                 {host.is_hidden && (
                   <span className="text-[10px] px-1 py-0.5 rounded bg-yellow-500/10 text-yellow-400 border border-yellow-500/20 flex-shrink-0">{t('hosts.statusHidden')}</span>
@@ -707,12 +846,12 @@ function HostCard({
             </p>
           </div>
           <div className="bg-[var(--glass-bg)] rounded-lg p-2">
-            <span className="text-dark-200 text-xs">SNI</span>
+            <span className="text-dark-200 text-xs">{t('hosts.form.sni')}</span>
             <p className="font-medium text-white truncate">{host.sni || '-'}</p>
           </div>
           {host.inbound && (
             <div className="bg-[var(--glass-bg)] rounded-lg p-2">
-              <span className="text-dark-200 text-xs">Inbound</span>
+              <span className="text-dark-200 text-xs">{t('hosts.form.inbound')}</span>
               <p className="font-medium text-white truncate">{host.inbound.tag}</p>
               <p className="text-[10px] text-dark-300">{host.inbound.type}</p>
             </div>
@@ -725,25 +864,25 @@ function HostCard({
           )}
           {host.host && (
             <div className="bg-[var(--glass-bg)] rounded-lg p-2">
-              <span className="text-dark-200 text-xs">Host</span>
+              <span className="text-dark-200 text-xs">{t('hosts.form.host')}</span>
               <p className="font-medium text-white truncate">{host.host}</p>
             </div>
           )}
           {host.path && (
             <div className="bg-[var(--glass-bg)] rounded-lg p-2">
-              <span className="text-dark-200 text-xs">Path</span>
+              <span className="text-dark-200 text-xs">{t('hosts.form.path')}</span>
               <p className="font-medium text-white truncate font-mono text-xs">{host.path}</p>
             </div>
           )}
           {host.alpn && (
             <div className="bg-[var(--glass-bg)] rounded-lg p-2">
-              <span className="text-dark-200 text-xs">ALPN</span>
+              <span className="text-dark-200 text-xs">{t('hosts.form.alpn')}</span>
               <p className="font-medium text-white truncate">{host.alpn}</p>
             </div>
           )}
           {host.fingerprint && (
             <div className="bg-[var(--glass-bg)] rounded-lg p-2">
-              <span className="text-dark-200 text-xs">Fingerprint</span>
+              <span className="text-dark-200 text-xs">{t('hosts.form.fingerprint')}</span>
               <p className="font-medium text-white truncate">{host.fingerprint}</p>
             </div>
           )}
@@ -777,6 +916,66 @@ function HostSkeleton() {
   )
 }
 
+function BulkEditHostsModal({ open, count, onClose, onApply, isPending }: {
+  open: boolean
+  count: number
+  onClose: () => void
+  onApply: (data: Record<string, unknown>) => void
+  isPending: boolean
+}) {
+  const { t } = useTranslation()
+  const [setPort, setSetPort] = useState(false)
+  const [portVal, setPortVal] = useState('')
+  const [setTags, setSetTags] = useState(false)
+  const [tagsVal, setTagsVal] = useState('')
+
+  useEffect(() => {
+    if (!open) { setSetPort(false); setPortVal(''); setSetTags(false); setTagsVal('') }
+  }, [open])
+
+  const apply = () => {
+    const data: Record<string, unknown> = {}
+    if (setPort) { const p = parseInt(portVal, 10); if (!isNaN(p)) data.port = p }
+    if (setTags) data.tags = tagsVal.split(',').map((s) => s.trim()).filter(Boolean)
+    onApply(data)
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={(o) => { if (!o) onClose() }}>
+      <DialogContent className="max-w-md">
+        <DialogHeader>
+          <DialogTitle>{t('hosts.bulk.editTitle', { count })}</DialogTitle>
+          <DialogDescription>{t('hosts.bulk.editHint')}</DialogDescription>
+        </DialogHeader>
+        <div className="space-y-4">
+          <div className="space-y-2">
+            <label className="flex items-center gap-2 text-sm text-dark-100 cursor-pointer select-none">
+              <input type="checkbox" className="accent-primary-500" checked={setPort} onChange={(e) => setSetPort(e.target.checked)} />
+              {t('hosts.editHost.port')}
+            </label>
+            {setPort && (
+              <Input type="number" min={1} max={65535} value={portVal} onChange={(e) => setPortVal(e.target.value)} placeholder="443" />
+            )}
+          </div>
+          <div className="space-y-2">
+            <label className="flex items-center gap-2 text-sm text-dark-100 cursor-pointer select-none">
+              <input type="checkbox" className="accent-primary-500" checked={setTags} onChange={(e) => setSetTags(e.target.checked)} />
+              {t('hosts.bulk.tags')}
+            </label>
+            {setTags && (
+              <Input type="text" value={tagsVal} onChange={(e) => setTagsVal(e.target.value)} placeholder="TAG1, TAG2" />
+            )}
+          </div>
+        </div>
+        <DialogFooter>
+          <Button variant="secondary" onClick={onClose} disabled={isPending}>{t('hosts.bulk.cancel')}</Button>
+          <Button onClick={apply} disabled={isPending || (!setPort && !setTags)}>{t('hosts.bulk.apply')}</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
 export default function Hosts() {
   const { t } = useTranslation()
   const queryClient = useQueryClient()
@@ -788,6 +987,19 @@ export default function Hosts() {
   const [showCreateModal, setShowCreateModal] = useState(false)
   const [createError, setCreateError] = useState('')
   const [deleteConfirmUuid, setDeleteConfirmUuid] = useState<string | null>(null)
+  const [viewMode, setViewMode] = useViewMode('hosts')
+  const [selected, setSelected] = useState<Set<string>>(new Set())
+  const [bulkEditOpen, setBulkEditOpen] = useState(false)
+  const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false)
+
+  const toggleSelect = (uuid: string) =>
+    setSelected((prev) => {
+      const next = new Set(prev)
+      if (next.has(uuid)) next.delete(uuid)
+      else next.add(uuid)
+      return next
+    })
+  const clearSelected = () => setSelected(new Set())
 
   // Fetch hosts
   const { data: hosts = [], isLoading, refetch } = useQuery({
@@ -823,6 +1035,7 @@ export default function Hosts() {
     mutationFn: (uuid: string) => client.delete(`/hosts/${uuid}`),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['hosts'] })
+      queryClient.invalidateQueries({ queryKey: ['admins'] })
       toast.success(t('hosts.toast.deleted'))
     },
     onError: (err: Error & { response?: { data?: { detail?: string } } }) => {
@@ -849,6 +1062,7 @@ export default function Hosts() {
     mutationFn: (data: Record<string, unknown>) => client.post('/hosts', data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['hosts'] })
+      queryClient.invalidateQueries({ queryKey: ['admins'] })
       setShowCreateModal(false)
       setCreateError('')
       toast.success(t('hosts.toast.created'))
@@ -856,6 +1070,24 @@ export default function Hosts() {
     onError: (err: Error & { response?: { data?: { detail?: string } } }) => {
       setCreateError(err.response?.data?.detail || err.message || t('hosts.toast.createError'))
       toast.error(err.response?.data?.detail || err.message || t('hosts.toast.createError'))
+    },
+  })
+
+  const bulkAction = useMutation({
+    mutationFn: async ({ action, data }: { action: 'enable' | 'disable' | 'delete' | 'update'; data?: Record<string, unknown> }) => {
+      const uuids = Array.from(selected)
+      if (action === 'update') return client.patch('/hosts/bulk', { uuids, ...(data || {}) })
+      return client.post(`/hosts/bulk/${action}`, { uuids })
+    },
+    onSuccess: (_res, vars) => {
+      queryClient.invalidateQueries({ queryKey: ['hosts'] })
+      if (vars.action === 'delete') queryClient.invalidateQueries({ queryKey: ['admins'] })
+      clearSelected()
+      setBulkEditOpen(false)
+      toast.success(t('hosts.bulk.done'))
+    },
+    onError: (err: Error & { response?: { data?: { detail?: string } } }) => {
+      toast.error(err.response?.data?.detail || err.message || t('hosts.toast.error'))
     },
   })
 
@@ -931,33 +1163,107 @@ export default function Hosts() {
         </Card>
       </div>
 
-      {/* Hosts grid */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        {isLoading ? (
-          Array.from({ length: 4 }).map((_, i) => <HostSkeleton key={i} />)
-        ) : hosts.length === 0 ? (
-          <Card className="col-span-full">
-            <CardContent className="py-12 text-center">
-              <Globe className="w-12 h-12 text-dark-300 mx-auto mb-3" />
-              <p className="text-dark-200">{t('hosts.statusNoHosts')}</p>
-            </CardContent>
-          </Card>
-        ) : (
-          hosts.map((host, i) => (
-            <div key={host.uuid} className="animate-fade-in-up" style={{ animationDelay: `${0.1 + i * 0.06}s` }}>
-              <HostCard
-                host={host}
-                onEdit={() => { setEditingHost(host); setEditError('') }}
-                onEnable={() => enableHost.mutate(host.uuid)}
-                onDisable={() => disableHost.mutate(host.uuid)}
-                onDelete={() => setDeleteConfirmUuid(host.uuid)}
-                canEdit={canEdit}
-                canDelete={canDelete}
+      {/* Toolbar: select-all + view toggle */}
+      {!isLoading && hosts.length > 0 && (
+        <div className="flex items-center justify-between gap-2">
+          {canEdit ? (
+            <label className="flex items-center gap-2 text-sm text-dark-200 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                className="accent-primary-500"
+                checked={selected.size > 0 && selected.size === hosts.length}
+                ref={(el) => { if (el) el.indeterminate = selected.size > 0 && selected.size < hosts.length }}
+                onChange={(e) => setSelected(e.target.checked ? new Set(hosts.map((h) => h.uuid)) : new Set())}
               />
-            </div>
-          ))
-        )}
-      </div>
+              {t('hosts.bulk.selectAll')}
+            </label>
+          ) : <div />}
+          <ViewToggle mode={viewMode} onChange={setViewMode} />
+        </div>
+      )}
+
+      {/* Bulk action bar */}
+      {selected.size > 0 && (
+        <div className="sticky top-2 z-20 flex flex-wrap items-center gap-2 rounded-lg border border-primary-500/30 bg-[var(--glass-bg)] backdrop-blur px-3 py-2 shadow-lg">
+          <span className="text-sm text-white font-medium">{t('hosts.bulk.selected', { count: selected.size })}</span>
+          <div className="flex-1" />
+          {canEdit && <Button size="sm" variant="secondary" onClick={() => bulkAction.mutate({ action: 'enable' })} disabled={bulkAction.isPending}>{t('hosts.bulk.enable')}</Button>}
+          {canEdit && <Button size="sm" variant="secondary" onClick={() => bulkAction.mutate({ action: 'disable' })} disabled={bulkAction.isPending}>{t('hosts.bulk.disable')}</Button>}
+          {canEdit && <Button size="sm" variant="secondary" onClick={() => setBulkEditOpen(true)} disabled={bulkAction.isPending}>{t('hosts.bulk.edit')}</Button>}
+          {canDelete && <Button size="sm" variant="destructive" onClick={() => setBulkDeleteOpen(true)} disabled={bulkAction.isPending}>{t('hosts.bulk.delete')}</Button>}
+          <Button size="sm" variant="ghost" onClick={clearSelected}>{t('hosts.bulk.clear')}</Button>
+        </div>
+      )}
+
+      {/* Hosts list */}
+      {!isLoading && viewMode === 'table' && hosts.length > 0 ? (
+        <HostsTable
+          hosts={hosts}
+          canEdit={canEdit}
+          canDelete={canDelete}
+          selected={selected}
+          onToggleSelect={toggleSelect}
+          onEdit={(h) => { setEditingHost(hosts.find((x) => x.uuid === h.uuid) ?? null); setEditError('') }}
+          onEnable={(h) => enableHost.mutate(h.uuid)}
+          onDisable={(h) => disableHost.mutate(h.uuid)}
+          onDelete={(h) => setDeleteConfirmUuid(h.uuid)}
+        />
+      ) : (
+        <div
+          className={cn(
+            'grid gap-4',
+            viewMode === 'compact'
+              ? 'grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4'
+              : 'grid-cols-1 lg:grid-cols-2',
+          )}
+        >
+          {isLoading ? (
+            Array.from({ length: 4 }).map((_, i) => <HostSkeleton key={i} />)
+          ) : hosts.length === 0 ? (
+            <Card className="col-span-full">
+              <CardContent className="py-12 text-center">
+                <Globe className="w-12 h-12 text-dark-300 mx-auto mb-3" />
+                <p className="text-dark-200">{t('hosts.statusNoHosts')}</p>
+              </CardContent>
+            </Card>
+          ) : (
+            hosts.map((host, i) => (
+              <div key={host.uuid} className="relative animate-fade-in-up" style={{ animationDelay: `${0.1 + i * 0.06}s` }}>
+                {canEdit && (
+                  <input
+                    type="checkbox"
+                    className="absolute top-3 left-3 z-10 accent-primary-500 w-4 h-4 cursor-pointer"
+                    checked={selected.has(host.uuid)}
+                    onChange={() => toggleSelect(host.uuid)}
+                    aria-label={t('hosts.bulk.selectOne', { name: host.remark || host.address })}
+                  />
+                )}
+                {viewMode === 'compact' ? (
+                  <HostCompactCard
+                    host={host}
+                    canEdit={canEdit}
+                    canDelete={canDelete}
+                    onEdit={(h) => { setEditingHost(hosts.find((x) => x.uuid === h.uuid) ?? null); setEditError('') }}
+                    onEnable={(h) => enableHost.mutate(h.uuid)}
+                    onDisable={(h) => disableHost.mutate(h.uuid)}
+                    onDelete={(h) => setDeleteConfirmUuid(h.uuid)}
+                  />
+                ) : (
+                  <HostCard
+                    host={host}
+                    onEdit={() => { setEditingHost(host); setEditError('') }}
+                    onEnable={() => enableHost.mutate(host.uuid)}
+                    onDisable={() => disableHost.mutate(host.uuid)}
+                    onDelete={() => setDeleteConfirmUuid(host.uuid)}
+                    canEdit={canEdit}
+                    canDelete={canDelete}
+                  />
+                )}
+              </div>
+            ))
+          )}
+        </div>
+      )}
 
       {/* Edit modal */}
       {editingHost && (
@@ -980,6 +1286,15 @@ export default function Hosts() {
         />
       )}
 
+      {/* Bulk edit modal */}
+      <BulkEditHostsModal
+        open={bulkEditOpen}
+        count={selected.size}
+        onClose={() => setBulkEditOpen(false)}
+        onApply={(data) => bulkAction.mutate({ action: 'update', data })}
+        isPending={bulkAction.isPending}
+      />
+
       {/* Confirm delete dialog */}
       <ConfirmDialog
         open={deleteConfirmUuid !== null}
@@ -994,6 +1309,17 @@ export default function Hosts() {
             setDeleteConfirmUuid(null)
           }
         }}
+      />
+
+      {/* Confirm bulk delete dialog */}
+      <ConfirmDialog
+        open={bulkDeleteOpen}
+        onOpenChange={(open) => { if (!open) setBulkDeleteOpen(false) }}
+        title={t('hosts.bulk.delete')}
+        description={t('hosts.bulk.confirmDelete', { count: selected.size })}
+        confirmLabel={t('hosts.bulk.delete')}
+        variant="destructive"
+        onConfirm={() => { bulkAction.mutate({ action: 'delete' }); setBulkDeleteOpen(false) }}
       />
     </div>
   )

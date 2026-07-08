@@ -10,6 +10,7 @@ from web.backend.api.deps import (
 )
 from web.backend.core.errors import api_error, E
 from web.backend.core.plugins import get_extra_rbac_resources
+from web.backend.core.audit import write_audit_log
 from web.backend.core.rbac import (
     list_roles,
     get_role_by_id,
@@ -17,7 +18,6 @@ from web.backend.core.rbac import (
     create_role,
     update_role,
     delete_role,
-    write_audit_log,
 )
 from web.backend.schemas.admin import (
     RoleCreate,
@@ -133,6 +133,21 @@ async def get_role(
     return _role_to_response(role)
 
 
+def _actor_is_superadmin(admin: AdminUser) -> bool:
+    # Legacy env-admin (account_id is None) резолвится как superadmin в deps.
+    return admin.role == "superadmin" or admin.account_id is None
+
+
+def _assert_permissions_subset(admin: AdminUser, permissions) -> None:
+    """Не-superadmin может назначать роли только те (resource, action), которыми
+    владеет сам — иначе roles:create/edit становится каналом самоповышения."""
+    if _actor_is_superadmin(admin):
+        return
+    requested = {(p.resource, p.action) for p in permissions}
+    if requested - admin.permissions:
+        raise api_error(403, E.FORBIDDEN, "Cannot grant permissions you do not hold")
+
+
 @router.post("", response_model=RoleResponse, status_code=201)
 async def create_new_role(
     request: Request,
@@ -152,6 +167,9 @@ async def create_new_role(
             raise api_error(400, E.UNKNOWN_RESOURCE, f"Unknown resource: {perm.resource}")
         if perm.action not in resources_map[perm.resource]:
             raise api_error(400, E.INVALID_ACTION, f"Invalid action '{perm.action}' for resource '{perm.resource}'")
+
+    # Privilege-escalation guard: only grant permissions the actor holds.
+    _assert_permissions_subset(admin, data.permissions)
 
     role = await create_role(
         name=data.name,
@@ -188,6 +206,14 @@ async def update_existing_role(
     if not existing:
         raise api_error(404, E.ROLE_NOT_FOUND)
 
+    # A non-superadmin must not touch system roles or their own role — either
+    # would let them rewrite the permission set backing their own access.
+    if not _actor_is_superadmin(admin):
+        if existing.get("is_system"):
+            raise api_error(403, E.FORBIDDEN, "System roles can only be edited by a superadmin")
+        if admin.role_id == role_id:
+            raise api_error(403, E.FORBIDDEN, "Cannot edit your own role")
+
     # Validate permissions if provided
     if data.permissions is not None:
         resources_map = get_resources_map()
@@ -196,6 +222,8 @@ async def update_existing_role(
                 raise api_error(400, E.UNKNOWN_RESOURCE, f"Unknown resource: {perm.resource}")
             if perm.action not in resources_map[perm.resource]:
                 raise api_error(400, E.INVALID_ACTION, f"Invalid action '{perm.action}' for resource '{perm.resource}'")
+        # Privilege-escalation guard: only grant permissions the actor holds.
+        _assert_permissions_subset(admin, data.permissions)
 
     role = await update_role(
         role_id=role_id,

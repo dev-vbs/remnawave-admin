@@ -1,6 +1,6 @@
 import { useState, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
-import { ShieldAlert, Eye, EyeOff, KeyRound, Check } from 'lucide-react'
+import { ShieldAlert, Eye, EyeOff, KeyRound, Check } from '@/components/brand/icons'
 import { authApi } from '@/api/auth'
 import { usePermissionStore } from '@/store/permissionStore'
 import { useAuthStore } from '@/store/authStore'
@@ -55,6 +55,7 @@ function PasswordInput({ value, onChange, placeholder, autoComplete, disabled }:
   autoComplete?: string
   disabled?: boolean
 }) {
+  const { t } = useTranslation()
   const [show, setShow] = useState(false)
   return (
     <div className="relative">
@@ -69,7 +70,7 @@ function PasswordInput({ value, onChange, placeholder, autoComplete, disabled }:
       />
       <button
         type="button"
-        tabIndex={-1}
+        aria-label={show ? t('common.hide') : t('common.show')}
         onClick={() => setShow(!show)}
         className="absolute right-3 top-1/2 -translate-y-1/2 text-dark-300 hover:text-dark-100"
       >

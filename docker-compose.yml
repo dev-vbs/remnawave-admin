@@ -101,6 +101,10 @@ services:
       WEB_PORT: '${WEB_BACKEND_PORT:-8081}'
       APP_MODE: '${APP_MODE:-full}'
       REDIS_URL: '${REDIS_URL:-}'
+      # Trust X-Real-IP/X-Forwarded-For only from the reverse proxy. The admin
+      # API shares the published collector port, so pin this to the frontend
+      # proxy's address to stop direct-port IP spoofing (see .env.example).
+      WEB_TRUSTED_PROXIES: '${WEB_TRUSTED_PROXIES:-}'
       MAXMIND_CITY_DB: /app/geoip/GeoLite2-City.mmdb
       MAXMIND_ASN_DB: /app/geoip/GeoLite2-ASN.mmdb
       BACKUP_DIR: /app/backups
@@ -145,8 +149,10 @@ services:
       WEB_PORT: '8081'
       APP_MODE: 'collector'
       REDIS_URL: '${REDIS_URL:-}'
+      WEB_TRUSTED_PROXIES: '${WEB_TRUSTED_PROXIES:-}'
       WEBHOOK_SECRET: '${WEBHOOK_SECRET:-}'
       BOT_WEBHOOK_URL: 'http://bot:${WEBHOOK_PORT:-8080}/webhook'
+      BOT_CALLBACK_URL: 'http://bot:${WEBHOOK_PORT:-8080}/internal/panel-event'
       MAXMIND_CITY_DB: /app/geoip/GeoLite2-City.mmdb
       MAXMIND_ASN_DB: /app/geoip/GeoLite2-ASN.mmdb
     command: ["python", "-m", "uvicorn", "web.backend.main:app", "--host", "0.0.0.0", "--port", "8081", "--no-access-log", "--log-level", "warning"]
@@ -198,11 +204,14 @@ services:
     user: "65534:65534"  # nobody:nobody, владелец /prometheus в образе
     volumes:
       - ./monitoring/prometheus.yml.tmpl:/etc/prometheus/prometheus.yml.tmpl:ro
+      - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
       - ./monitoring/entrypoint.sh:/usr/local/bin/entrypoint.sh:ro
       - prometheus_data:/prometheus
     environment:
       METRICS_AUTH_TOKEN: ${METRICS_AUTH_TOKEN:-}
       PROMETHEUS_RETENTION: ${PROMETHEUS_RETENTION:-30d}
+      # Scrape target port: 8081 (full) or 8082 (APP_MODE=api split). Must match WEB_BACKEND_PORT.
+      WEB_BACKEND_PORT: ${WEB_BACKEND_PORT:-8081}
     entrypoint: ["/bin/sh", "/usr/local/bin/entrypoint.sh"]
     ports:
       - "${PROMETHEUS_PORT:-9090}:9090"

@@ -36,6 +36,8 @@ vi.mock('@/api/auth', () => ({
       username: 'admin',
       role: 'superadmin',
       role_id: 1,
+      account_id: 1,
+      unlimited_traffic_policy: 'allowed',
       auth_method: 'password',
       password_is_generated: false,
       permissions: [],
@@ -323,6 +325,24 @@ describe('Page smoke tests', () => {
   it('MailServer renders without errors', async () => {
     const MailServer = (await import('@/pages/MailServer')).default
     const { container } = renderPage(<MailServer />)
+    expect(container).toBeTruthy()
+  })
+
+  it('Reports renders without errors', async () => {
+    const Reports = (await import('@/pages/Reports')).default
+    const { container } = renderPage(<Reports />)
+    expect(container).toBeTruthy()
+  })
+
+  it('Resources renders without errors', async () => {
+    const Resources = (await import('@/pages/Resources')).default
+    const { container } = renderPage(<Resources />)
+    expect(container).toBeTruthy()
+  })
+
+  it('Billing renders without errors', async () => {
+    const Billing = (await import('@/pages/Billing')).default
+    const { container } = renderPage(<Billing />)
     expect(container).toBeTruthy()
   })
 

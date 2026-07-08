@@ -60,6 +60,7 @@ from web.backend.api.v2 import webhooks as webhooks_api
 from web.backend.api.v2 import squads as squads_api
 from web.backend.api.v2.bedolaga import router as bedolaga_router
 from web.backend.api.v2 import plugins as plugins_api
+from web.backend.api.v2 import internal as internal_api
 from web.backend.core import plugins as plugin_loader
 from web.backend.api.v3 import public as public_api_v3
 
@@ -346,7 +347,7 @@ async def _run_migrations(database_url: str) -> bool:
         from alembic import command
         from alembic.runtime.migration import MigrationContext
         from alembic.script import ScriptDirectory
-        from sqlalchemy import create_engine
+        from sqlalchemy import create_engine, text
 
         # Normalise URL to sync psycopg2 driver
         raw_url = str(database_url)
@@ -390,19 +391,21 @@ async def _run_migrations(database_url: str) -> bool:
                 )
 
                 pending = heads - current_heads
-                # ``stale`` = revisions the DB knows about but our code
-                # doesn't. Happens when a plugin's wheel isn't loaded yet
-                # this run (fresh container after pull) — its branch is
-                # still in the DB from previous runs. We deliberately do
-                # not try to clean those up: the plugin's pip install
-                # will land later in the lifespan and the next migration
-                # pass will see them again as known revisions.
-                stale = current_heads - heads
-                if stale:
+                # ``unresolvable`` = revisions stamped in alembic_version
+                # that don't exist in our script graph at all — plugin
+                # branches whose wheel isn't loaded this run. Compared
+                # against *all* known revisions (walk_revisions), not just
+                # heads, so a panel revision the DB merely sits behind
+                # (e.g. 0069 while head is 0071) is NOT misclassified and
+                # wiped. The plugin's pip install lands later in the
+                # lifespan and reconciles its branch then.
+                known_revs = {sc.revision for sc in script.walk_revisions()}
+                unresolvable = current_heads - known_revs
+                if unresolvable:
                     logger.info(
                         "Revisions present in DB but unknown to current code: %s "
                         "(plugin not loaded yet — will be reconciled after install)",
-                        sorted(stale),
+                        sorted(unresolvable),
                     )
 
                 if not pending:
@@ -414,7 +417,28 @@ async def _run_migrations(database_url: str) -> bool:
                 connection = engine.connect()
                 try:
                     alembic_cfg.attributes["connection"] = connection
+                    # ``unresolvable`` heads are plugin branches whose wheel
+                    # isn't loaded this run; ``alembic upgrade`` must resolve
+                    # *every* current head to plan the path — so an unknown
+                    # one would crash and block the panel's own pending
+                    # migrations. Detach only those (never a known panel
+                    # revision) for the upgrade and restore them after, in
+                    # one transaction; the plugin's later pip install
+                    # re-grafts its branch, so its migration record survives.
+                    if unresolvable:
+                        connection.execute(
+                            text("DELETE FROM alembic_version WHERE version_num = ANY(:s)"),
+                            {"s": list(unresolvable)},
+                        )
                     command.upgrade(alembic_cfg, "heads")
+                    if unresolvable:
+                        connection.execute(
+                            text(
+                                "INSERT INTO alembic_version (version_num) VALUES (:v) "
+                                "ON CONFLICT DO NOTHING"
+                            ),
+                            [{"v": s} for s in unresolvable],
+                        )
                     connection.commit()
                 except Exception:
                     connection.rollback()
@@ -490,6 +514,12 @@ async def lifespan(app: FastAPI):
                 # Initialize dynamic config service (DB settings cache)
                 from shared.config_service import config_service
                 await config_service.initialize()
+                # Авто-reload конфига из БД для ВСЕХ режимов. В split-режиме (APP_MODE=collector/api
+                # в разных процессах) collector иначе держит stale-кэш и не видит правок настроек
+                # из UI (их обслуживает api-процесс) до рестарта контейнера.
+                config_service.start_auto_reload(
+                    int(config_service.get("config_auto_reload_interval", 30) or 30)
+                )
 
                 # ── Services for API and full mode ──
                 if app_mode in ("api", "full"):
@@ -532,6 +562,26 @@ async def lifespan(app: FastAPI):
                             await asyncio.sleep(1800)
                     _bg_tasks.append(asyncio.create_task(_baseline_refresh_loop()))
 
+                    # C3: периодический HWID-скан. Детектор по батчам node-agent проверяет только
+                    # юзеров с активными подключениями СЕЙЧАС, поэтому кросс-аккаунт HWID у оффлайн-
+                    # абузеров не ловится. Этот цикл периодически ставит юзеров с общими HWID в очередь.
+                    async def _hwid_scan_loop():
+                        from web.backend.api.v2.collector import _enqueue_violation_users
+                        await asyncio.sleep(600)
+                        while True:
+                            try:
+                                if config_service.get("violations_enabled", True) and config_service.get("violations_analyzer_hwid", True):
+                                    rows = await db_service.get_shared_hwids(min_users=2, limit=1000)
+                                    uuids = {r["user_uuid"] for r in rows if r.get("user_uuid")}
+                                    if uuids:
+                                        _enqueue_violation_users(uuids)
+                                        logger.info("HWID scan: %d users sharing HWIDs enqueued for violation check", len(uuids))
+                            except Exception as exc:
+                                logger.warning("HWID scan loop failed: %s", exc)
+                            interval = int(config_service.get("violations_hwid_scan_interval_minutes", 30) or 30)
+                            await asyncio.sleep(max(5, interval) * 60)
+                    _bg_tasks.append(asyncio.create_task(_hwid_scan_loop()))
+
                 # ── Services for all modes ──
                 async def _maintenance_loop():
                     while True:
@@ -541,6 +591,20 @@ async def lifespan(app: FastAPI):
                             logger.info("Periodic table maintenance completed")
                         except Exception as exc:
                             logger.warning("Table maintenance failed: %s", exc)
+                        # M5: retention-очистка по расписанию, независимо от ingest
+                        # коллектора — иначе при простое нод старые данные не чистятся.
+                        # cleanup-методы идемпотентны, дубль с collector-путём безопасен.
+                        try:
+                            v_days = int(config_service.get("violation_retention_days", 90) or 90)
+                            c_days = int(config_service.get("connections_retention_days", 30) or 30)
+                            t_days = int(config_service.get("torrent_retention_days", 90) or 90)
+                            v = await db_service.cleanup_old_violations(v_days)
+                            c = await db_service.cleanup_old_connections(c_days)
+                            t = await db_service.cleanup_old_torrent_events(t_days)
+                            if (v or 0) + (c or 0) + (t or 0) > 0:
+                                logger.info("Retention cleanup: %s violations, %s connections, %s torrent events", v, c, t)
+                        except Exception as exc:
+                            logger.warning("Retention cleanup failed: %s", exc)
                 _bg_tasks.append(asyncio.create_task(_maintenance_loop()))
 
                 # ── Plugins (api and full only) ──
@@ -803,7 +867,7 @@ def create_app() -> FastAPI:
         allow_origins=cors_origins,
         allow_credentials=True,
         allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-        allow_headers=["Authorization", "Content-Type"],
+        allow_headers=["Authorization", "Content-Type", "X-CSRF-Token"],
     )
 
     # Request body size limit (10 MB)
@@ -836,9 +900,12 @@ def create_app() -> FastAPI:
                 "connect-src 'self'"
             )
         else:
+            # telegram.org убран из script-src: виджет логина теперь
+            # вендорится фронтом (/vendor/telegram-widget.js), внешние
+            # скрипты бэкенд-страницам не нужны.
             response.headers["Content-Security-Policy"] = (
                 "default-src 'self'; "
-                "script-src 'self' https://telegram.org; "
+                "script-src 'self'; "
                 "style-src 'self' 'unsafe-inline'; "
                 "img-src 'self' data: https:; "
                 "connect-src 'self' wss: ws:; "
@@ -945,6 +1012,7 @@ def create_app() -> FastAPI:
         app.include_router(bedolaga_router, prefix="/api/v2/bedolaga", tags=["bedolaga"])
 
         app.include_router(plugins_api.router, prefix="/api/v2/plugins", tags=["plugins"])
+        app.include_router(internal_api.router, prefix="/api/v2/internal", tags=["internal"])
 
         from web.backend.api.v2 import admin_plugins as admin_plugins_api
         app.include_router(

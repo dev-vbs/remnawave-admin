@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
-import { Clock, Plus, Trash2, ShieldCheck, FileCode } from 'lucide-react'
+import { Clock, Plus, Trash2, ShieldCheck, FileCode } from '@/components/brand/icons'
 import {
   Dialog,
   DialogContent,
@@ -310,6 +310,7 @@ export default function ScheduleFormDialog({
                       type="button"
                       size="icon"
                       variant="ghost"
+                      aria-label={t('common.delete')}
                       onClick={() => handleRemoveEnvVar(i)}
                       className="h-8 w-8 text-red-400"
                     >

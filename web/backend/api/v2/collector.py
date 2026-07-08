@@ -20,6 +20,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from shared.database import db_service
+from shared.db_schema import NODES_TABLE
+from shared.db_query import select_sql
 from shared.connection_monitor import ConnectionMonitor
 from shared.violation_detector import IntelligentViolationDetector, ViolationAction
 from shared.agent_tokens import get_node_by_token
@@ -29,6 +31,7 @@ from shared.metrics import (
     COLLECTOR_BATCHES_REJECTED,
     COLLECTOR_CONNECTIONS_PROCESSED,
 )
+from web.backend.core.webhook_security import fire_event
 
 logger = logging.getLogger(__name__)
 
@@ -249,9 +252,8 @@ async def verify_agent_token(
     authorization: str = Header(..., alias="Authorization"),
 ) -> str:
     """Проверяет Bearer token агента. Возвращает node_uuid."""
-    client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (
-        request.client.host if request.client else "unknown"
-    )
+    from web.backend.api.deps import get_client_ip
+    client_ip = get_client_ip(request)
 
     logger.debug("Verifying agent token (length: %d) from %s", len(authorization) if authorization else 0, client_ip)
 
@@ -272,7 +274,7 @@ async def verify_agent_token(
         try:
             async with db_service.acquire() as conn:
                 row = await conn.fetchrow(
-                    "SELECT name, address FROM nodes WHERE address LIKE $1 LIMIT 1",
+                    select_sql(NODES_TABLE, "name, address", "WHERE address LIKE $1 LIMIT 1"),
                     f"%{client_ip}%",
                 )
                 if row:
@@ -375,7 +377,8 @@ async def receive_connections(
         except Exception as e:
             logger.warning("Failed to cleanup old metrics snapshots: %s", e)
         try:
-            deleted = await db_service.cleanup_old_connections(CONNECTIONS_RETENTION_DAYS)
+            c_days = int(config_service.get("connections_retention_days", CONNECTIONS_RETENTION_DAYS) or CONNECTIONS_RETENTION_DAYS)
+            deleted = await db_service.cleanup_old_connections(c_days)
             if deleted > 0:
                 logger.info("Cleaned up %d old connections", deleted)
         except Exception as e:
@@ -387,7 +390,8 @@ async def receive_connections(
         except Exception as e:
             logger.debug("Failed to ensure connection partitions: %s", e)
         try:
-            deleted = await db_service.cleanup_old_torrent_events(90)
+            t_days = int(config_service.get("torrent_retention_days", 90) or 90)
+            deleted = await db_service.cleanup_old_torrent_events(t_days)
             if deleted > 0:
                 logger.info("Cleaned up %d old torrent events", deleted)
         except Exception as e:
@@ -584,7 +588,7 @@ async def _process_torrent_violations(
                 ips = list(set(e.ip_address for e in user_events))
 
                 # Save as violation (score=100)
-                violation_id = await db_service.save_violation(
+                violation_id, violation_created = await db_service.save_violation(
                     user_uuid=user_uuid,
                     score=100.0,
                     recommended_action="hard_block",
@@ -600,6 +604,22 @@ async def _process_torrent_violations(
                     simultaneous_connections=len(ips),
                     unique_ips_count=len(ips),
                 )
+
+                if not violation_created:
+                    # Дедуп: свежая pending-запись уже есть — не спамим событиями
+                    logger.debug("Torrent violation deduplicated for user %s (id=%s)", user_uuid, violation_id)
+                    continue
+
+                fire_event("violation.created", {
+                    "violation_id": violation_id,
+                    "user_uuid": user_uuid,
+                    "username": username,
+                    "score": 100.0,
+                    "recommended_action": "hard_block",
+                    "reasons": [f"Torrent traffic detected ({len(user_events)} events)"],
+                    "ip_addresses": ips,
+                    "source": "torrent",
+                })
 
                 # Notification
                 try:
@@ -651,6 +671,13 @@ async def _process_torrent_violations(
                         from shared.api_client import api_client
                         await api_client.disable_user(user_uuid)
                         logger.info("Auto-blocked user %s for torrent usage", user_uuid)
+                        fire_event("user.blocked", {
+                            "uuid": user_uuid,
+                            "username": username,
+                            "reason": "torrent",
+                            "details": f"Torrent traffic detected ({len(user_events)} events)",
+                            "blocked_by": "auto",
+                        })
                     except Exception as e:
                         logger.warning("Failed to auto-block user %s: %s", user_uuid, e)
 
@@ -659,227 +686,6 @@ async def _process_torrent_violations(
 
     except Exception as e:
         logger.error("Background torrent violation processing failed: %s", e)
-
-
-async def _check_single_user(user_uuid: str, min_score: float, sem: asyncio.Semaphore, cooldown_override: Optional[int] = None):
-    """Check a single user for violations (with semaphore for concurrency control)."""
-    async with sem:
-        try:
-            # Whitelist check
-            whitelisted, excluded_analyzers = await db_service.is_user_violation_whitelisted(user_uuid)
-            if whitelisted and excluded_analyzers is None:
-                logger.debug("User %s is fully whitelisted, skipping violation check", user_uuid)
-                return
-
-            # Per-user cooldown (adaptive or config-based)
-            now_check = datetime.utcnow()
-            last_check = _violation_check_cooldown.get(user_uuid)
-            cooldown_minutes = cooldown_override if cooldown_override is not None else config_service.get("violation_check_cooldown_minutes", VIOLATION_CHECK_COOLDOWN_MINUTES)
-            if last_check and (now_check - last_check).total_seconds() < cooldown_minutes * 60:
-                _stats["total_skipped_cooldown"] += 1
-                return
-
-            stats = await connection_monitor.get_user_connection_stats(user_uuid, window_minutes=60)
-            if stats:
-                logger.debug(
-                    "Connection stats for user %s: active=%d, unique_ips=%d, simultaneous=%d",
-                    user_uuid, stats.active_connections_count,
-                    stats.unique_ips_in_window, stats.simultaneous_connections,
-                )
-
-            violation_score = await violation_detector.check_user(
-                user_uuid, window_minutes=60, excluded_analyzers=excluded_analyzers
-            )
-
-            had_violation = bool(violation_score and violation_score.total >= min_score)
-
-            # ── HWID Blacklist check ──
-            try:
-                user_devices = await db_service.get_user_hwid_devices(user_uuid)
-                if user_devices:
-                    user_hwids = [d["hwid"] for d in user_devices if d.get("hwid")]
-                    if user_hwids:
-                        bl_matches = await db_service.check_hwids_against_blacklist(user_hwids)
-                        if bl_matches:
-                            from web.backend.api.v2.violations import _handle_blacklisted_hwid_users
-                            # Process ALL matched HWIDs (prioritize block over alert)
-                            bl_matches.sort(key=lambda m: 0 if m["action"] == "block" else 1)
-                            for match in bl_matches:
-                                user_entry = [{"user_uuid": user_uuid, "username": None}]
-                                await _handle_blacklisted_hwid_users(
-                                    match["hwid"],
-                                    match["action"],
-                                    match.get("reason"),
-                                    user_entry,
-                                )
-                                if match["action"] == "block":
-                                    break  # Already blocked, no need to process more
-            except Exception as e:
-                logger.debug("HWID blacklist check failed for %s: %s", user_uuid, e)
-
-            # ── User Blacklist check (Telegram ID) ──
-            if config_service.get("user_blacklist_enabled", False):
-                try:
-                    user_info_bl = await db_service.get_user_by_uuid(user_uuid)
-                    tg_id = user_info_bl.get("telegram_id") if user_info_bl else None
-                    if tg_id:
-                        bl_entry = await db_service.is_telegram_id_blacklisted(int(tg_id))
-                        if bl_entry:
-                            logger.warning("User %s (tg_id=%d) is in blacklist: %s", user_uuid, tg_id, bl_entry.get("reason", ""))
-                            if config_service.get("user_blacklist_auto_block", False):
-                                try:
-                                    from shared.api_client import api_client
-                                    await api_client.disable_user(user_uuid)
-                                    logger.info("Auto-blocked blacklisted user: %s (tg_id=%d)", user_uuid, tg_id)
-                                except Exception:
-                                    pass
-                except Exception as e:
-                    logger.debug("User blacklist check failed for %s: %s", user_uuid, e)
-
-            # Evict oldest 20% entries if cooldown dict is too large
-            if len(_violation_check_cooldown) > MAX_COOLDOWN_SIZE:
-                sorted_keys = sorted(_violation_check_cooldown, key=_violation_check_cooldown.get)
-                evict_count = len(sorted_keys) // 5
-                for k in sorted_keys[:evict_count]:
-                    _violation_check_cooldown.pop(k, None)
-                logger.warning("Cooldown cache eviction: removed %d entries (was %d, limit %d)",
-                               evict_count, len(sorted_keys), MAX_COOLDOWN_SIZE)
-            # Кулдаун всегда: полный если нарушений нет, короткий (5 мин) если есть
-            _violation_check_cooldown[user_uuid] = datetime.utcnow() if not had_violation else (datetime.utcnow() - timedelta(minutes=max(0, cooldown_minutes - 5)))
-
-            if had_violation:
-                _stats["total_violations_found"] += 1
-                logger.warning(
-                    "Violation detected: user=%s score=%.1f action=%s reasons=%s",
-                    user_uuid, violation_score.total,
-                    violation_score.recommended_action.value,
-                    violation_score.reasons[:3],
-                )
-
-                active_conns = await connection_monitor.get_user_active_connections(user_uuid, max_age_minutes=5)
-                user_info = await db_service.get_user_by_uuid(user_uuid)
-
-                ip_metadata = {}
-                if active_conns:
-                    try:
-                        from shared.geoip import get_geoip_service
-                        geoip = get_geoip_service()
-                        unique_ips = list(set(str(c.ip_address) for c in active_conns))
-                        ip_metadata = await geoip.lookup_batch(unique_ips)
-                    except Exception as geo_error:
-                        logger.warning("GeoIP lookup failed for user %s: %s", user_uuid, geo_error)
-
-                # Skip notification for whitelisted users (partial whitelist may still detect violations
-                # from non-excluded analyzers, but we don't want to notify about them)
-                if whitelisted:
-                    logger.debug("User %s is whitelisted, skipping violation notification", user_uuid)
-                else:
-                    try:
-                        from web.backend.core.violation_notifier import send_violation_notification
-                        await send_violation_notification(
-                            user_uuid=user_uuid,
-                            violation_score={
-                                "total": violation_score.total,
-                                "recommended_action": violation_score.recommended_action,
-                                "reasons": violation_score.reasons,
-                                "breakdown": violation_score.breakdown,
-                                "confidence": violation_score.confidence,
-                            },
-                            user_info=user_info,
-                            active_connections=active_conns,
-                            ip_metadata=ip_metadata,
-                        )
-                    except Exception as notify_error:
-                        logger.warning("Failed to send violation notification for user %s: %s", user_uuid, notify_error)
-
-                try:
-                    breakdown = violation_score.breakdown
-                    temporal = breakdown.get("temporal")
-                    geo = breakdown.get("geo")
-                    asn = breakdown.get("asn")
-                    profile = breakdown.get("profile")
-                    device = breakdown.get("device")
-                    hwid = breakdown.get("hwid")
-                    ua = breakdown.get("user_agent")
-
-                    ip_addresses = list(set(str(c.ip_address) for c in active_conns)) if active_conns else None
-                    username = user_info.get("username") if user_info else None
-                    email = user_info.get("email") if user_info else None
-                    telegram_id = user_info.get("telegram_id") if user_info else None
-                    device_limit = user_info.get("hwidDeviceLimit", 1) if user_info else 1
-
-                    await db_service.save_violation(
-                        user_uuid=user_uuid,
-                        score=violation_score.total,
-                        recommended_action=violation_score.recommended_action.value,
-                        username=username,
-                        email=email,
-                        telegram_id=telegram_id,
-                        confidence=violation_score.confidence,
-                        temporal_score=temporal.score if temporal else None,
-                        geo_score=geo.score if geo else None,
-                        asn_score=asn.score if asn else None,
-                        profile_score=profile.score if profile else None,
-                        device_score=device.score if device else None,
-                        ip_addresses=ip_addresses,
-                        countries=list(geo.countries) if geo and geo.countries else None,
-                        cities=list(geo.cities) if geo and geo.cities else None,
-                        asn_types=list(asn.asn_types) if asn and asn.asn_types else None,
-                        os_list=device.os_list if device else None,
-                        client_list=device.client_list if device else None,
-                        reasons=violation_score.reasons[:10] if violation_score.reasons else None,
-                        simultaneous_connections=temporal.simultaneous_connections_count if temporal else None,
-                        unique_ips_count=len(ip_addresses) if ip_addresses else None,
-                        device_limit=device_limit,
-                        impossible_travel=geo.impossible_travel_detected if geo else False,
-                        is_mobile=asn.is_mobile_carrier if asn else False,
-                        is_datacenter=asn.is_datacenter if asn else False,
-                        is_vpn=asn.is_vpn if asn else False,
-                        hwid_score=hwid.score if hwid else None,
-                        hwid_matched_users=json.dumps(hwid.matched_details) if hwid and hwid.matched_details else None,
-                        user_agent_score=ua.score if ua else None,
-                        suspicious_user_agents=json.dumps([
-                            {
-                                "request_id": s.request_id,
-                                "user_agent": s.user_agent,
-                                "request_ip": s.request_ip,
-                                "request_at": s.request_at,
-                                "classification": s.classification,
-                            }
-                            for s in ua.suspicious_agents
-                        ]) if ua and ua.suspicious_agents else None,
-                    )
-                    logger.info("Violation saved      user=%-10s  score=%.1f", user_uuid[:8], violation_score.total)
-
-                    # Auto-block in Remnawave Panel when hard_block is recommended
-                    if violation_score.recommended_action == ViolationAction.HARD_BLOCK:
-                        try:
-                            from shared.api_client import api_client
-                            await api_client.disable_user(user_uuid)
-                            logger.warning("Auto-blocked user   user=%-10s  score=%.1f  action=hard_block", user_uuid[:8], violation_score.total)
-                        except Exception as block_error:
-                            logger.warning("Failed to auto-block user %s: %s", user_uuid, block_error)
-
-                    # WebSocket broadcast for real-time UI updates
-                    try:
-                        from web.backend.api.v2.websocket import broadcast_violation
-                        await broadcast_violation({
-                            "user_uuid": user_uuid,
-                            "username": username,
-                            "score": violation_score.total,
-                            "recommended_action": violation_score.recommended_action.value,
-                            "reasons": violation_score.reasons[:5],
-                        })
-                    except Exception as e:
-                        logger.debug("WebSocket broadcast failed for violation: %s", e)
-
-                except Exception as save_error:
-                    logger.warning("Failed to save violation to DB for user %s: %s", user_uuid, save_error)
-            else:
-                if violation_score:
-                    logger.debug("User %s below threshold: score=%.1f", user_uuid[:8], violation_score.total)
-        except Exception as e:
-            logger.warning("Error checking violations for user %s: %s", user_uuid, e)
 
 
 async def _run_violation_detection(affected_user_uuids: set):
@@ -1029,6 +835,13 @@ async def _run_violation_detection(affected_user_uuids: set):
                                 from shared.api_client import api_client
                                 await api_client.disable_user(uid)
                                 logger.info("Auto-blocked blacklisted user: %s (tg_id=%d)", uid, tg_id)
+                                fire_event("user.blocked", {
+                                    "uuid": uid,
+                                    "username": uinfo.get("username"),
+                                    "reason": "blacklist",
+                                    "details": bl_entry.get("reason", ""),
+                                    "blocked_by": "auto",
+                                })
                             except Exception:
                                 pass
             except Exception as e:
@@ -1109,7 +922,7 @@ async def _handle_violation(
         telegram_id = user_info.get("telegram_id") if user_info else None
         device_limit = user_info.get("hwidDeviceLimit", 1) if user_info else 1
 
-        await db_service.save_violation(
+        violation_id, violation_created = await db_service.save_violation(
             user_uuid=user_uuid,
             score=violation_score.total,
             recommended_action=violation_score.recommended_action.value,
@@ -1145,14 +958,47 @@ async def _handle_violation(
             ]) if ua and ua.suspicious_agents else None,
         )
 
+        if not violation_created:
+            # Дедуп вернул существующую pending-запись: события и автоблок уже
+            # отработали при её создании — повторные срабатывания (в т.ч.
+            # автоматизаций на violation.created) только путают админа.
+            logger.debug("Violation deduplicated for user %s (id=%s)", user_uuid, violation_id)
+            return
+
+        fire_event("violation.created", {
+            "violation_id": violation_id,
+            "user_uuid": user_uuid,
+            "username": username,
+            "score": violation_score.total,
+            "confidence": violation_score.confidence,
+            "recommended_action": violation_score.recommended_action.value,
+            "reasons": violation_score.reasons[:10] if violation_score.reasons else [],
+            "ip_addresses": ip_addresses,
+            "source": "detector",
+        })
+
         from shared.violation_detector import ViolationAction
         if violation_score.recommended_action == ViolationAction.HARD_BLOCK:
-            try:
-                from shared.api_client import api_client
-                await api_client.disable_user(user_uuid)
-                logger.warning("Auto-blocked user %s score=%.1f", user_uuid[:8], violation_score.total)
-            except Exception as block_error:
-                logger.warning("Failed to auto-block user %s: %s", user_uuid, block_error)
+            if config_service.get("violation_auto_hard_block", True):
+                try:
+                    from shared.api_client import api_client
+                    await api_client.disable_user(user_uuid)
+                    logger.warning("Auto-blocked user %s score=%.1f", user_uuid[:8], violation_score.total)
+                    fire_event("user.blocked", {
+                        "uuid": user_uuid,
+                        "username": username,
+                        "reason": "violation",
+                        "details": f"hard_block recommended (score={violation_score.total:.1f})",
+                        "violation_id": violation_id,
+                        "blocked_by": "auto",
+                    })
+                except Exception as block_error:
+                    logger.warning("Failed to auto-block user %s: %s", user_uuid, block_error)
+            else:
+                logger.info(
+                    "Auto-block skipped for user %s (violation_auto_hard_block=off, score=%.1f)",
+                    user_uuid[:8], violation_score.total,
+                )
 
         try:
             from web.backend.api.v2.websocket import broadcast_violation
@@ -1254,7 +1100,7 @@ async def collector_stats(request: Request):
             "config": {
                 "drain_interval_sec": config_service.get("violation_drain_interval", _VIOLATION_DRAIN_INTERVAL),
                 "chunk_size": config_service.get("violation_chunk_size", _VIOLATION_CHUNK_SIZE),
-                "cooldown_minutes": config_service.get("violations_check_cooldown_minutes", VIOLATION_CHECK_COOLDOWN_MINUTES),
+                "cooldown_minutes": config_service.get("violation_check_cooldown_minutes", VIOLATION_CHECK_COOLDOWN_MINUTES),
                 "max_background_tasks": config_service.get("violation_max_background_tasks", _MAX_BACKGROUND_TASKS),
             },
             "worker_started_at": _stats["worker_started_at"],
@@ -1315,20 +1161,47 @@ async def collector_webhook(request: Request):
         logger.warning("Webhook sync failed for %s: %s", event, e)
 
     # 2. Forward to bot for Telegram notifications (fire-and-forget)
-    bot_webhook_url = os.environ.get("BOT_WEBHOOK_URL", "http://bot:8080/webhook")
-    try:
-        async with httpx.AsyncClient(timeout=5) as client:
-            resp = await client.post(
-                bot_webhook_url,
-                content=body,
-                headers={
-                    "content-type": "application/json",
-                    "x-remnawave-signature": request.headers.get("x-remnawave-signature", ""),
-                },
-            )
-            if resp.status_code != 200:
-                logger.warning("Bot webhook forward failed: %d", resp.status_code)
-    except Exception as e:
-        logger.warning("Bot webhook forward error: %s", e)
+    # Uses INTERNAL_API_SECRET instead of X-Remnawave-Signature
+    bot_callback_url = os.environ.get("BOT_CALLBACK_URL", "http://bot:8080/internal/panel-event")
+    internal_secret = os.environ.get("INTERNAL_API_SECRET", "")
+    if internal_secret:
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                resp = await client.post(
+                    bot_callback_url,
+                    content=body,
+                    headers={
+                        "content-type": "application/json",
+                        "X-Internal-Api-Secret": internal_secret,
+                    },
+                )
+                if resp.status_code != 200:
+                    logger.warning("Bot callback forward failed: %d", resp.status_code)
+        except Exception as e:
+            logger.warning("Bot callback forward error: %s", e)
+    else:
+        # Fallback: forward raw webhook to legacy bot webhook (deprecated)
+        logger.warning(
+            "DEPRECATED: INTERNAL_API_SECRET is not set. "
+            "Falling back to legacy BOT_WEBHOOK_URL (%s). "
+            "Set INTERNAL_API_SECRET in .env and remove BOT_WEBHOOK_URL to use the new "
+            "internal API proxy (adds RBAC, quota enforcement, and audit logging).",
+            os.environ.get("BOT_WEBHOOK_URL", "http://bot:8080/webhook"),
+        )
+        bot_webhook_url = os.environ.get("BOT_WEBHOOK_URL", "http://bot:8080/webhook")
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                resp = await client.post(
+                    bot_webhook_url,
+                    content=body,
+                    headers={
+                        "content-type": "application/json",
+                        "x-remnawave-signature": request.headers.get("x-remnawave-signature", ""),
+                    },
+                )
+                if resp.status_code != 200:
+                    logger.warning("Bot webhook forward failed: %d", resp.status_code)
+        except Exception as e:
+            logger.warning("Bot webhook forward error: %s", e)
 
     return JSONResponse(status_code=200, content={"status": "ok", "event": event})

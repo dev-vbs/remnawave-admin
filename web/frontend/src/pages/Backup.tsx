@@ -21,7 +21,7 @@ import {
   Send,
   Search,
   Recycle,
-} from 'lucide-react'
+} from '@/components/brand/icons'
 import { backupApi } from '../api/backup'
 import { useAuthStore } from '../store/authStore'
 import { Button } from '@/components/ui/button'
@@ -134,7 +134,7 @@ function BackupsTab() {
       queryClient.invalidateQueries({ queryKey: ['backup-files'] })
       queryClient.invalidateQueries({ queryKey: ['backup-disk-usage'] })
     },
-    onError: (err: any) => toast.error(err.response?.data?.detail || 'Upload failed', { duration: 8000 }),
+    onError: (err: any) => toast.error(err.response?.data?.detail || t('backup.toastUploadFailed'), { duration: 8000 }),
   })
 
   const rotateMutation = useMutation({
@@ -144,7 +144,7 @@ function BackupsTab() {
       queryClient.invalidateQueries({ queryKey: ['backup-files'] })
       queryClient.invalidateQueries({ queryKey: ['backup-disk-usage'] })
     },
-    onError: () => toast.error('Rotation failed'),
+    onError: () => toast.error(t('backup.toastRotationFailed')),
   })
 
   const telegramMutation = useMutation({
@@ -154,7 +154,7 @@ function BackupsTab() {
       toast.success(t('backup.sentToTelegram', { defaultValue: `Sent ${data.parts_sent} part(s) to Telegram` }))
       setTelegramDialog(null)
     },
-    onError: (err: any) => toast.error(err.response?.data?.detail || 'Send failed', { duration: 8000 }),
+    onError: (err: any) => toast.error(err.response?.data?.detail || t('backup.toastSendFailed'), { duration: 8000 }),
   })
 
   const handleUpload = () => {
@@ -171,20 +171,19 @@ function BackupsTab() {
   const handleDownload = (filename: string) => {
     const url = backupApi.downloadBackup(filename)
     const a = document.createElement('a')
-    a.href = url
     a.download = filename
-    if (token) {
-      fetch(url, { headers: { Authorization: `Bearer ${token}` } })
-        .then((r) => r.blob())
-        .then((blob) => {
-          const blobUrl = URL.createObjectURL(blob)
-          a.href = blobUrl
-          a.click()
-          URL.revokeObjectURL(blobUrl)
-        })
-    } else {
-      a.click()
-    }
+    // Bearer — пока access есть в памяти; иначе HttpOnly cookie (credentials)
+    fetch(url, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      credentials: 'include',
+    })
+      .then((r) => r.blob())
+      .then((blob) => {
+        const blobUrl = URL.createObjectURL(blob)
+        a.href = blobUrl
+        a.click()
+        URL.revokeObjectURL(blobUrl)
+      })
   }
 
   const handleExportFullConfig = async () => {
@@ -238,7 +237,7 @@ function BackupsTab() {
             </div>
             <div>
               <p className="text-sm font-medium text-white">{t('backup.createDatabase')}</p>
-              <p className="text-xs text-dark-300">PostgreSQL dump</p>
+              <p className="text-xs text-dark-300">{t('backup.postgresqlDump')}</p>
             </div>
           </button>
 
@@ -333,6 +332,7 @@ function BackupsTab() {
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
             className="pl-8 h-8 w-40 text-xs bg-[var(--glass-bg)]"
+            aria-label={t('common.search')}
           />
         </div>
       </div>
@@ -464,7 +464,7 @@ function BackupsTab() {
           </DialogHeader>
           <div className="space-y-3">
             <div>
-              <label className="text-xs text-dark-200 mb-1 block">Chat ID <span className="text-dark-400">({t('backup.leaveEmptyDefault', { defaultValue: 'leave empty for default' })})</span></label>
+              <label className="text-xs text-dark-200 mb-1 block">{t('backup.chatId')} <span className="text-dark-400">({t('backup.leaveEmptyDefault', { defaultValue: 'leave empty for default' })})</span></label>
               <Input
                 placeholder="-100123456789"
                 value={telegramDialog?.chatId || ''}
@@ -504,6 +504,8 @@ function BackupsTab() {
 function ImportTab() {
   const { t } = useTranslation()
   const queryClient = useQueryClient()
+
+  const [confirmOverwrite, setConfirmOverwrite] = useState<string | null>(null)
 
   const { data: files = [] } = useQuery({
     queryKey: ['backup-files'],
@@ -568,7 +570,7 @@ function ImportTab() {
                     <Button
                       size="sm" variant="destructive" className="gap-1.5 text-xs"
                       disabled={importConfig.isPending}
-                      onClick={() => importConfig.mutate({ filename: file.filename, overwrite: true })}
+                      onClick={() => setConfirmOverwrite(file.filename)}
                     >
                       <RefreshCw className="w-3.5 h-3.5" />
                       {t('backup.importOverwrite')}
@@ -618,6 +620,16 @@ function ImportTab() {
           )}
         </CardContent>
       </Card>
+
+      <ConfirmDialog
+        open={confirmOverwrite !== null}
+        onOpenChange={(open) => { if (!open) setConfirmOverwrite(null) }}
+        title={t('backup.confirmOverwriteTitle', { defaultValue: 'Перезаписать настройки?' })}
+        description={t('backup.confirmOverwriteDesc', { defaultValue: 'Существующие настройки будут перезаписаны значениями из файла. Действие необратимо.' })}
+        confirmLabel={t('backup.importOverwrite')}
+        variant="destructive"
+        onConfirm={() => { if (confirmOverwrite) importConfig.mutate({ filename: confirmOverwrite, overwrite: true }) }}
+      />
     </div>
   )
 }
@@ -682,6 +694,7 @@ function HistoryTab() {
               value={searchInput}
               onChange={(e) => setSearchInput(e.target.value)}
               className="pl-8 h-8 text-xs bg-[var(--glass-bg)]"
+              aria-label={t('common.search')}
             />
           </div>
           <div className="flex flex-wrap items-center gap-1">

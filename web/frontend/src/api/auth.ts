@@ -54,8 +54,19 @@ export interface AdminInfo {
   username: string
   role: string
   role_id: number | null
+  account_id: number | null
+  max_users: number | null
+  max_traffic_gb: number | null
+  max_nodes: number | null
+  max_hosts: number | null
+  users_created: number
+  traffic_used_bytes: number
+  nodes_created: number
+  hosts_created: number
+  unlimited_traffic_policy: string
   auth_method: string
   password_is_generated: boolean
+  unrestricted_user_access: boolean
   permissions: PermissionEntry[]
 }
 
@@ -223,12 +234,15 @@ export const authApi = {
   },
 
   /**
-   * Refresh access token
+   * Refresh access token.
+   * Без аргумента сервер берёт refresh из HttpOnly cookie rw_refresh;
+   * с аргументом — легаси-путь (токен из старого localStorage).
    */
-  refreshToken: async (refreshToken: string): Promise<TokenResponse> => {
-    const response = await client.post<TokenResponse>('/auth/refresh', {
-      refresh_token: refreshToken,
-    })
+  refreshToken: async (refreshToken?: string | null): Promise<TokenResponse> => {
+    const response = await client.post<TokenResponse>(
+      '/auth/refresh',
+      refreshToken ? { refresh_token: refreshToken } : {}
+    )
     return response.data
   },
 

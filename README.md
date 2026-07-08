@@ -10,7 +10,7 @@
 [![Python](https://img.shields.io/badge/Python-3.11+-green)](https://www.python.org/)
 [![Tests](https://img.shields.io/badge/tests-1200%2B%20backend%20%2F%20260%2B%20frontend-brightgreen)](web/backend/tests)
 [![Prometheus](https://img.shields.io/badge/Prometheus-ready-e6522c?logo=prometheus&logoColor=white)](docs/README.md)
-[![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
+[![License](https://img.shields.io/badge/License-AGPL%20v3-blue)](LICENSE)
 
 [English](README_EN.md) | [Русский](README.md)
 
@@ -564,7 +564,6 @@ remnawave-admin/
 | [docs/README.md](docs/README.md) | Мониторинг, каталог Prometheus-метрик, интеграция с VictoriaMetrics |
 | [WEBHOOK_SETUP.md](WEBHOOK_SETUP.md) | Настройка webhook + HMAC-подпись |
 | [web/README.md](web/README.md) | Веб-панель: настройка, реверс-прокси, API |
-| [web/SECURITY_AUDIT.md](web/SECURITY_AUDIT.md) | Аудит безопасности веб-панели |
 | [node-agent/README.md](node-agent/README.md) | Node Agent: установка, настройка, troubleshooting |
 | [docs/API.md](docs/API.md), [docs/API-ENDPOINTS.md](docs/API-ENDPOINTS.md) | Внешний API v3 |
 | [docs/WEBHOOKS-EVENTS.md](docs/WEBHOOKS-EVENTS.md), [docs/WEBHOOKS-SIGNATURES.md](docs/WEBHOOKS-SIGNATURES.md) | Каталог webhook-событий и подписи |
@@ -640,7 +639,9 @@ docker exec -it <container_name> python3 scripts/admin_cli.py list-admins
 
 ## 📄 Лицензия
 
-MIT License — см. [LICENSE](LICENSE).
+GNU Affero General Public License v3.0 с дополнением для плагинов (plugin exception, §7) — см. [LICENSE](LICENSE). Прежние версии (≤ 2.15.x) остаются под MIT.
+
+**Коммерческая лицензия** (проприетарное использование без обязательств AGPL) — по запросу. Вклады принимаются по [CLA](CLA.md): подпись запрашивается автоматически при первом pull request.
 
 ---
 

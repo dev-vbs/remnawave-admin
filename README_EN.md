@@ -6,7 +6,7 @@
 
 [![Docker](https://img.shields.io/badge/Docker-Ready-blue)](https://www.docker.com/)
 [![Python](https://img.shields.io/badge/Python-3.12+-green)](https://www.python.org/)
-[![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
+[![License](https://img.shields.io/badge/License-AGPL%20v3-blue)](LICENSE)
 
 [English](README_EN.md) | [Русский](README.md)
 
@@ -530,12 +530,12 @@ remnawave-admin/
 
 | Document | Description |
 |----------|-------------|
-| [CHANGELOG.md](CHANGELOG.md) | Version history |
+| [docs/README.md](docs/README.md) | Monitoring, Prometheus metrics catalog, VictoriaMetrics integration |
 | [WEBHOOK_SETUP.md](WEBHOOK_SETUP.md) | Webhook setup guide |
-| [docs/anti-abuse.md](docs/anti-abuse.md) | Anti-Abuse system, ASN database, provider classification |
 | [web/README.md](web/README.md) | Web panel: setup, reverse proxy, API |
-| [web/SECURITY_AUDIT.md](web/SECURITY_AUDIT.md) | Web panel security audit |
 | [node-agent/README.md](node-agent/README.md) | Node Agent: installation, configuration, troubleshooting |
+| [docs/API.md](docs/API.md), [docs/API-ENDPOINTS.md](docs/API-ENDPOINTS.md) | External API v3 |
+| [docs/WEBHOOKS-EVENTS.md](docs/WEBHOOKS-EVENTS.md), [docs/WEBHOOKS-SIGNATURES.md](docs/WEBHOOKS-SIGNATURES.md) | Webhook event catalog and signatures |
 
 ---
 
@@ -577,7 +577,9 @@ docker compose config                # Check configuration
 
 ## 📄 License
 
-MIT License — see [LICENSE](LICENSE).
+GNU Affero General Public License v3.0 with a plugin exception (§7) — see [LICENSE](LICENSE). Earlier versions (≤ 2.15.x) remain under MIT.
+
+A **commercial license** (proprietary use without AGPL obligations) is available on request. Contributions are accepted under the [CLA](CLA.md): signing is requested automatically on your first pull request.
 
 ---
 

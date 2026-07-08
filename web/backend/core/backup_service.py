@@ -9,6 +9,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, List
 
+from shared.db_schema import BOT_CONFIG_TABLE
+from shared.db_query import select_sql, update_sql
+
 logger = logging.getLogger(__name__)
 
 BACKUP_DIR = Path(os.environ.get("BACKUP_DIR", "/app/backups"))
@@ -50,6 +53,13 @@ async def create_database_backup(database_url: str) -> dict:
 
         size_bytes = filepath.stat().st_size
 
+        from web.backend.core.webhook_security import fire_event
+        fire_event("backup.created", {
+            "filename": filename,
+            "size_bytes": size_bytes,
+            "backup_type": "database",
+        })
+
         return {
             "filename": filename,
             "size_bytes": size_bytes,
@@ -61,7 +71,9 @@ async def create_database_backup(database_url: str) -> dict:
 
 async def restore_database_backup(database_url: str, filename: str) -> None:
     """Restore a PostgreSQL dump from a backup file."""
-    filepath = BACKUP_DIR / filename
+    filepath = _safe_backup_path(filename)
+    if filepath is None:
+        raise ValueError(f"Invalid backup filename: {filename}")
     if not filepath.exists():
         raise FileNotFoundError(f"Backup file not found: {filename}")
 
@@ -107,9 +119,10 @@ async def export_config() -> dict:
         from shared.database import db_service
         async with db_service.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT key, value, value_type, category, subcategory, "
-                "display_name, description, default_value, is_secret, is_readonly "
-                "FROM bot_config ORDER BY category, key"
+                select_sql(BOT_CONFIG_TABLE,
+                    "key, value, value_type, category, subcategory, "
+                    "display_name, description, default_value, is_secret, is_readonly",
+                    "ORDER BY category, key")
             )
 
         settings = []
@@ -129,6 +142,13 @@ async def export_config() -> dict:
         filepath.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
         size_bytes = filepath.stat().st_size
 
+        from web.backend.core.webhook_security import fire_event
+        fire_event("backup.created", {
+            "filename": filename,
+            "size_bytes": size_bytes,
+            "backup_type": "config",
+        })
+
         return {
             "filename": filename,
             "size_bytes": size_bytes,
@@ -144,7 +164,9 @@ async def import_config(filename: str, overwrite: bool = False) -> dict:
 
     Returns dict with imported_count, skipped_count.
     """
-    filepath = BACKUP_DIR / filename
+    filepath = _safe_backup_path(filename)
+    if filepath is None:
+        raise ValueError(f"Invalid config filename: {filename}")
     if not filepath.exists():
         raise FileNotFoundError(f"Config file not found: {filename}")
 
@@ -169,14 +191,14 @@ async def import_config(filename: str, overwrite: bool = False) -> dict:
 
             if not overwrite:
                 existing = await conn.fetchval(
-                    "SELECT value FROM bot_config WHERE key = $1", key
+                    select_sql(BOT_CONFIG_TABLE, "value", "WHERE key = $1"), key
                 )
                 if existing is not None:
                     skipped += 1
                     continue
 
             await conn.execute(
-                "UPDATE bot_config SET value = $2, updated_at = NOW() WHERE key = $1",
+                update_sql(BOT_CONFIG_TABLE, "value = $2, updated_at = NOW()", "key = $1"),
                 key, str(value),
             )
             imported += 1
@@ -191,7 +213,9 @@ async def import_users_from_file(filename: str) -> dict:
 
     Returns dict with imported_count, skipped_count, errors.
     """
-    filepath = BACKUP_DIR / filename
+    filepath = _safe_backup_path(filename)
+    if filepath is None:
+        raise ValueError(f"Invalid import filename: {filename}")
     if not filepath.exists():
         raise FileNotFoundError(f"File not found: {filename}")
 

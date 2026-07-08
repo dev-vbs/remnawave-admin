@@ -29,22 +29,38 @@ from shared.analyzers.hwid import HwidCrossAccountAnalyzer
 from shared.analyzers.user_agent import UserAgentAnalyzer
 
 
+# Веса факторов (module-level for access from _validate_weights)
+WEIGHTS = {
+    'temporal': 0.20,      # Временной паттерн (было 0.25)
+    'geo': 0.20,           # География (было 0.25)
+    'asn': 0.10,           # Тип провайдера (было 0.15)
+    'profile': 0.15,       # Отклонение от профиля (было 0.20)
+    'device': 0.10,        # Платформы устройств по SRH-UA (analyze_srh): per-connection
+                           # UA нет (node-agent пишет только IP+email), поэтому источник —
+                           # User-Agent подписочных запросов. Разные ОС сверх лимита = шаринг.
+    'hwid': 0.25,          # Кросс-аккаунт HWID (сильный сигнал)
+}
+
+def _validate_weights(weights):
+    """Проверяет, что сумма весов равна 1.0."""
+    total = sum(weights.values())
+    if abs(total - 1.0) > 0.001:
+        raise ValueError(
+            f"Веса факторов должны суммироваться в 1.0, но их сумма равна {total}. "
+            f"Веса: {weights}"
+        )
+
+_validate_weights(WEIGHTS)
+
+
 class IntelligentViolationDetector:
     """
     Система многофакторного анализа для детектирования нарушений.
 
     Объединяет результаты всех анализаторов и вычисляет итоговый скор нарушения.
     """
-    
-    # Веса факторов
-    WEIGHTS = {
-        'temporal': 0.20,      # Временной паттерн (было 0.25)
-        'geo': 0.20,           # География (было 0.25)
-        'asn': 0.10,           # Тип провайдера (было 0.15)
-        'profile': 0.15,       # Отклонение от профиля (было 0.20)
-        'device': 0.10,        # Fingerprint устройств (было 0.15)
-        'hwid': 0.25,          # Кросс-аккаунт HWID (сильный сигнал)
-    }
+
+    WEIGHTS = WEIGHTS
     
     # Пороги для действий
     THRESHOLDS = {
@@ -71,7 +87,7 @@ class IntelligentViolationDetector:
         self.temporal_analyzer = TemporalAnalyzer()
         self.geo_analyzer = GeoAnalyzer(geoip_service=geoip)
         self.asn_analyzer = ASNAnalyzer(geoip_service=geoip)
-        self.profile_analyzer = UserProfileAnalyzer(db_service)
+        self.profile_analyzer = UserProfileAnalyzer(db_service, geoip_service=geoip)
         self.device_analyzer = DeviceFingerprintAnalyzer()
         self.hwid_analyzer = HwidCrossAccountAnalyzer(db_service)
         self.user_agent_analyzer = UserAgentAnalyzer()
@@ -198,8 +214,22 @@ class IntelligentViolationDetector:
                 connection_history_30d=connection_history_30d,
             )
 
-            # Анализируем fingerprint устройств (с учётом лимита устройств)
-            device_score = self.device_analyzer.analyze(active_connections, connection_history, user_device_count)
+            # SRH (User-Agent подписочных запросов) — общий источник для device и
+            # user_agent анализаторов. Грузим один раз: per-connection UA нет
+            # (node-agent пишет только IP+email), поэтому device определяет
+            # платформы устройств именно по SRH-UA.
+            srh_records: Optional[List[Dict[str, Any]]] = None
+            try:
+                srh_records = prefetched_srh_records if prefetched_srh_records is not None else await self._fetch_srh_records(user_uuid)
+            except Exception as srh_err:
+                logger.warning("SRH fetch failed for %s: %s", user_uuid, srh_err)
+
+            # Анализируем устройства: по SRH-UA (основной путь), иначе fallback на
+            # per-connection fingerprint (обычно пустой → 0).
+            if srh_records:
+                device_score = self.device_analyzer.analyze_srh(srh_records, user_device_count)
+            else:
+                device_score = self.device_analyzer.analyze(active_connections, connection_history, user_device_count)
 
             # Анализируем кросс-аккаунт HWID
             hwid_score = await self.hwid_analyzer.analyze(user_uuid, prefetched_shared=prefetched_shared_hwids)
@@ -208,7 +238,6 @@ class IntelligentViolationDetector:
             ua_score = UserAgentScore(score=0.0, reasons=[])
             if config_service.get("violations_analyzer_user_agent", True) and "user_agent" not in (excluded_analyzers or []):
                 try:
-                    srh_records = prefetched_srh_records if prefetched_srh_records is not None else await self._fetch_srh_records(user_uuid)
                     if srh_records is not None:
                         ua_whitelist_extra = config_service.get("violation_ua_whitelist_extra", []) or []
                         ua_blacklist_extra = config_service.get("violation_ua_blacklist_extra", []) or []
@@ -342,19 +371,51 @@ class IntelligentViolationDetector:
                     known_pairs_modifier, score_before_pairs, raw_score
                 )
 
+            # Strong-signal bypass: один мощный одиночный сигнал (>=85) не должен полностью
+            # гаситься consistency/dampening на ПЕРВОМ срабатывании. Иначе явный шаринг
+            # (impossible-travel гео, кросс-аккаунт HWID, ссылка-в-UA) не доходит до порога
+            # нарушения — это и есть причина, по которой детектор почти не создаёт нарушений
+            # через взвешенный путь (consistency ×0.3 на первом срабатывании съедает всё, а
+            # чтобы consistency стал 1.0, нужны уже записанные нарушения, которых неоткуда взять).
+            # temporal НЕ считаем «сильным сигналом» для bypass, если это мобильный / один ASN /
+            # переключение сетей: CGNAT там штатно даёт пачку одновременных IP (temporal может
+            # дойти до 100 при >5 IP), но это не явный шаринг. geo/hwid/ua остаются сильными всегда.
+            _temporal_suppressed = is_network_switch or _has_mobile or (is_same_asn and asn_ratio >= 0.8)
+            _strongest_signal = max(
+                geo_score.score, hwid_score.score, ua_score.score,
+                (0.0 if _temporal_suppressed else temporal_score.score),
+                profile_score.score, asn_score.score, device_score.score,
+            )
+            if _strongest_signal >= 85.0:
+                raw_score = max(raw_score, 50.0)
+
             # Если есть серьёзные одновременные подключения (высокий скор), устанавливаем минимум
             # Применяем только для очевидных нарушений (temporal >= 80), чтобы не создавать
             # ложных срабатываний при обычном переключении сетей
-            # Не применяем если обнаружен паттерн переключения сетей
-            if not is_network_switch:
+            #
+            # НЕ применяем жёсткий floor, если:
+            #  - это паттерн переключения сетей (WiFi <-> Mobile), ИЛИ
+            #  - есть мобильные подключения (CGNAT даёт пачку IP с одного устройства), ИЛИ
+            #  - все/почти все IP от одного провайдера (один ASN = один NAT, а не разные люди).
+            # Иначе мобильные юзеры, чей connection_type GeoIP не распознал как mobile,
+            # ловят ложное нарушение (temporal 80 → floor 70), перебивающее ASN/consistency-снижения.
+            # Реальный шаринг через одного провайдера всё равно ловится subnet-/HWID-проверками.
+            floor_suppressed = is_network_switch or _has_mobile or (is_same_asn and asn_ratio >= 0.8)
+            if not floor_suppressed:
                 if temporal_score.score >= 80.0 and temporal_score.simultaneous_connections_count > 1:
                     raw_score = max(raw_score, 70.0)
 
-            # HWID кросс-аккаунт — стопроцентное нарушение, минимум 80 (soft_block)
-            if hwid_score.score >= 100.0 and hwid_score.other_accounts_count >= 1:
+            # HWID-нарушение квалифицируется ИЛИ кросс-аккаунтом (другие аккаунты делят HWID),
+            # ИЛИ абузом мультитарифа (один telegram_id с N подписками на одном HWID — там
+            # other_accounts_count=0, поэтому отдельный флаг, иначе мультитариф не детектится).
+            _hwid_qualifies = hwid_score.other_accounts_count >= 1 or getattr(hwid_score, "per_account_abuse", False)
+            # Кросс-аккаунт / мультитариф — сильное нарушение, минимум 80 (soft_block).
+            # Порог 85 (а не 100): hwid_score=100 требует overflow>=3 = 6+ аккаунтов на HWID,
+            # а классические «3-5 аккаунтов на телефоне» дают 85 и раньше проваливались в floor 50.
+            if hwid_score.score >= 85.0 and _hwid_qualifies:
                 raw_score = max(raw_score, 80.0)
-            # Промежуточные HWID скоры (65+) с подтверждёнными аккаунтами — минимум 50 (monitor)
-            elif hwid_score.score >= 65.0 and hwid_score.other_accounts_count >= 1:
+            # Промежуточные HWID скоры (65+) — минимум 50 (monitor)
+            elif hwid_score.score >= 65.0 and _hwid_qualifies:
                 raw_score = max(raw_score, 50.0)
 
             # User-Agent hard floors — явные сигналы переопределяют взвешенный скор
@@ -905,8 +966,6 @@ class IntelligentViolationDetector:
             return ViolationAction.WARN
         elif score < self.THRESHOLDS['soft_block']:
             return ViolationAction.SOFT_BLOCK
-        elif score < self.THRESHOLDS['temp_block']:
-            return ViolationAction.TEMP_BLOCK
         elif score < self.THRESHOLDS['hard_block']:
             return ViolationAction.TEMP_BLOCK
         else:

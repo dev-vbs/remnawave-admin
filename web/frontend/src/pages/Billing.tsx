@@ -15,7 +15,7 @@ import {
   ExternalLink,
   Calendar,
   BarChart3,
-} from 'lucide-react'
+} from '@/components/brand/icons'
 import { billingApi, Provider } from '../api/billing'
 import client from '../api/client'
 import { Button } from '@/components/ui/button'
@@ -189,8 +189,20 @@ export default function Billing({ embedded }: { embedded?: boolean } = {}) {
 
   // ── Billing Nodes ───────────────────────────────────────────────
   const [nodeDialogOpen, setNodeDialogOpen] = useState(false)
-  const [nodeFormData, setNodeFormData] = useState({ providerUuid: '', nodeUuid: '', nextBillingAt: '' })
+  // 2.8.0: биллинг-нода — либо существующая нода панели, либо пользовательское название
+  const [nodeMode, setNodeMode] = useState<'existing' | 'custom'>('existing')
+  const [nodeFormData, setNodeFormData] = useState({ providerUuid: '', nodeUuid: '', customName: '', nextBillingAt: '' })
   const [deleteNodeConfirm, setDeleteNodeConfirm] = useState<string | null>(null)
+
+  const openNodeDialog = () => {
+    setNodeMode('existing')
+    // 2.8.0 требует дату всегда — дефолт как в панели: сегодня
+    const now = new Date()
+    const pad = (n: number) => String(n).padStart(2, '0')
+    const local = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}T${pad(now.getHours())}:${pad(now.getMinutes())}`
+    setNodeFormData({ providerUuid: '', nodeUuid: '', customName: '', nextBillingAt: local })
+    setNodeDialogOpen(true)
+  }
 
   const { data: nodesData, isLoading: nodesLoading, isError: isNodesError, refetch: refetchNodes } = useQuery({
     queryKey: ['billing-nodes'],
@@ -206,11 +218,11 @@ export default function Billing({ embedded }: { embedded?: boolean } = {}) {
   })
 
   const createNodeMutation = useMutation({
-    mutationFn: (data: { providerUuid: string; nodeUuid: string; nextBillingAt?: string }) =>
+    mutationFn: (data: { providerUuid: string; nodeUuid?: string; name?: string; nextBillingAt?: string }) =>
       billingApi.createNode(data),
     onSuccess: () => {
       setNodeDialogOpen(false)
-      setNodeFormData({ providerUuid: '', nodeUuid: '', nextBillingAt: '' })
+      setNodeFormData({ providerUuid: '', nodeUuid: '', customName: '', nextBillingAt: '' })
       queryClient.invalidateQueries({ queryKey: ['billing-nodes'] })
       queryClient.invalidateQueries({ queryKey: ['billing-providers'] })
       toast.success(t('billing.nodes.created'))
@@ -236,8 +248,12 @@ export default function Billing({ embedded }: { embedded?: boolean } = {}) {
   const handleCreateNode = () => {
     createNodeMutation.mutate({
       providerUuid: nodeFormData.providerUuid,
-      nodeUuid: nodeFormData.nodeUuid,
-      nextBillingAt: nodeFormData.nextBillingAt || undefined,
+      ...(nodeMode === 'custom'
+        ? { name: nodeFormData.customName.trim() }
+        : { nodeUuid: nodeFormData.nodeUuid }),
+      nextBillingAt: nodeFormData.nextBillingAt
+        ? new Date(nodeFormData.nextBillingAt).toISOString()
+        : undefined,
     })
   }
 
@@ -300,7 +316,7 @@ export default function Billing({ embedded }: { embedded?: boolean } = {}) {
           <div className="flex items-center justify-between">
             <p className="text-sm text-dark-200">{t('billing.providers.description')}</p>
             <div className="flex gap-2">
-              <Button variant="outline" size="sm" onClick={() => refetchProviders()}>
+              <Button variant="outline" size="sm" onClick={() => refetchProviders()} aria-label={t('common.refresh')}>
                 <RefreshCw className="w-4 h-4" />
               </Button>
               {canCreate && (
@@ -354,6 +370,7 @@ export default function Billing({ embedded }: { embedded?: boolean } = {}) {
                               size="sm"
                               onClick={() => openProviderDialog(provider)}
                               className="h-7 px-2"
+                              aria-label={t('common.edit')}
                             >
                               <Pencil className="w-4 h-4" />
                             </Button>
@@ -364,6 +381,7 @@ export default function Billing({ embedded }: { embedded?: boolean } = {}) {
                               size="sm"
                               onClick={() => setDeleteProviderConfirm(provider.uuid)}
                               className="text-red-400 hover:text-red-300 hover:bg-red-500/10 h-7 px-2"
+                              aria-label={t('common.delete')}
                             >
                               <Trash2 className="w-4 h-4" />
                             </Button>
@@ -404,7 +422,7 @@ export default function Billing({ embedded }: { embedded?: boolean } = {}) {
           <div className="flex items-center justify-between">
             <p className="text-sm text-dark-200">{t('billing.history.description')}</p>
             <div className="flex gap-2">
-              <Button variant="outline" size="sm" onClick={() => refetchHistory()}>
+              <Button variant="outline" size="sm" onClick={() => refetchHistory()} aria-label={t('common.refresh')}>
                 <RefreshCw className="w-4 h-4" />
               </Button>
               {canCreate && (
@@ -492,6 +510,7 @@ export default function Billing({ embedded }: { embedded?: boolean } = {}) {
                                 size="sm"
                                 onClick={() => setDeleteHistoryConfirm(record.uuid)}
                                 className="text-red-400 hover:text-red-300 hover:bg-red-500/10"
+                                aria-label={t('common.delete')}
                               >
                                 <Trash2 className="w-4 h-4" />
                               </Button>
@@ -512,11 +531,11 @@ export default function Billing({ embedded }: { embedded?: boolean } = {}) {
           <div className="flex items-center justify-between">
             <p className="text-sm text-dark-200">{t('billing.nodes.description')}</p>
             <div className="flex gap-2">
-              <Button variant="outline" size="sm" onClick={() => refetchNodes()}>
+              <Button variant="outline" size="sm" onClick={() => refetchNodes()} aria-label={t('common.refresh')}>
                 <RefreshCw className="w-4 h-4" />
               </Button>
               {canCreate && (
-                <Button size="sm" onClick={() => setNodeDialogOpen(true)}>
+                <Button size="sm" onClick={openNodeDialog}>
                   <Plus className="w-4 h-4 mr-2" />
                   {t('billing.nodes.create')}
                 </Button>
@@ -602,10 +621,19 @@ export default function Billing({ embedded }: { embedded?: boolean } = {}) {
                       {billingNodes.map((node) => (
                         <tr key={node.uuid} className="hover:bg-[var(--glass-bg)] transition-colors">
                           <td className="px-4 py-3 text-sm">
-                            <div className="flex items-center gap-2">
-                              <span className="text-lg">{node.node.countryCode}</span>
-                              <span className="text-white">{node.node.name}</span>
-                            </div>
+                            {node.node ? (
+                              <div className="flex items-center gap-2">
+                                <span className="text-lg">{node.node.countryCode}</span>
+                                <span className="text-white">{node.node.name}</span>
+                              </div>
+                            ) : (
+                              <div className="flex items-center gap-2">
+                                <span className="text-white">{node.name || '—'}</span>
+                                <Badge variant="outline" className="text-xs text-dark-300">
+                                  {t('billing.nodes.customBadge')}
+                                </Badge>
+                              </div>
+                            )}
                           </td>
                           <td className="px-4 py-3 text-sm text-white">{node.provider.name}</td>
                           <td className="px-4 py-3 text-sm">
@@ -620,6 +648,7 @@ export default function Billing({ embedded }: { embedded?: boolean } = {}) {
                                 size="sm"
                                 onClick={() => setDeleteNodeConfirm(node.uuid)}
                                 className="text-red-400 hover:text-red-300 hover:bg-red-500/10"
+                                aria-label={t('common.delete')}
                               >
                                 <Trash2 className="w-4 h-4" />
                               </Button>
@@ -809,27 +838,54 @@ export default function Billing({ embedded }: { embedded?: boolean } = {}) {
                 </SelectContent>
               </Select>
             </div>
-            <div>
-              <Label htmlFor="nodeSelect">{t('billing.nodes.nodeLabel')}</Label>
-              <Select
-                value={nodeFormData.nodeUuid}
-                onValueChange={(value) => setNodeFormData({ ...nodeFormData, nodeUuid: value })}
-              >
-                <SelectTrigger className="mt-1">
-                  <SelectValue placeholder={t('billing.nodes.nodePlaceholder')} />
-                </SelectTrigger>
-                <SelectContent>
-                  {Array.isArray(availableNodes?.items) && availableNodes.items.map((node) => (
-                    <SelectItem key={node.uuid} value={node.uuid}>
-                      <span className="flex items-center gap-2">
-                        <span>{node.countryCode}</span>
-                        <span>{node.name}</span>
-                      </span>
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
+            <Tabs value={nodeMode} onValueChange={(v) => setNodeMode(v as 'existing' | 'custom')}>
+              <TabsList className="grid w-full grid-cols-2">
+                <TabsTrigger value="existing">
+                  <Server className="w-4 h-4 mr-2" />
+                  {t('billing.nodes.tabExistingNode')}
+                </TabsTrigger>
+                <TabsTrigger value="custom">
+                  <Pencil className="w-4 h-4 mr-2" />
+                  {t('billing.nodes.tabCustomName')}
+                </TabsTrigger>
+              </TabsList>
+            </Tabs>
+            {nodeMode === 'existing' ? (
+              <div>
+                <Label htmlFor="nodeSelect">{t('billing.nodes.nodeLabel')}</Label>
+                <Select
+                  value={nodeFormData.nodeUuid}
+                  onValueChange={(value) => setNodeFormData({ ...nodeFormData, nodeUuid: value })}
+                >
+                  <SelectTrigger className="mt-1">
+                    <SelectValue placeholder={t('billing.nodes.nodePlaceholder')} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {Array.isArray(availableNodes?.items) && availableNodes.items.map((node) => (
+                      <SelectItem key={node.uuid} value={node.uuid}>
+                        <span className="flex items-center gap-2">
+                          <span>{node.countryCode}</span>
+                          <span>{node.name}</span>
+                        </span>
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+            ) : (
+              <div>
+                <Label htmlFor="customName">{t('billing.nodes.customNameLabel')}</Label>
+                <Input
+                  id="customName"
+                  value={nodeFormData.customName}
+                  onChange={(e) => setNodeFormData({ ...nodeFormData, customName: e.target.value })}
+                  placeholder={t('billing.nodes.customNamePlaceholder')}
+                  maxLength={255}
+                  className="mt-1"
+                />
+                <p className="text-xs text-dark-300 mt-1">{t('billing.nodes.customNameHint')}</p>
+              </div>
+            )}
             <div>
               <Label htmlFor="nextBillingAt">{t('billing.nodes.nextBillingLabel')}</Label>
               <Input
@@ -847,7 +903,12 @@ export default function Billing({ embedded }: { embedded?: boolean } = {}) {
             </Button>
             <Button
               onClick={handleCreateNode}
-              disabled={!nodeFormData.providerUuid || !nodeFormData.nodeUuid || createNodeMutation.isPending}
+              disabled={
+                !nodeFormData.providerUuid ||
+                (nodeMode === 'existing' ? !nodeFormData.nodeUuid : !nodeFormData.customName.trim()) ||
+                !nodeFormData.nextBillingAt ||
+                createNodeMutation.isPending
+              }
             >
               {createNodeMutation.isPending ? t('common.creating') : t('common.create')}
             </Button>
@@ -945,8 +1006,8 @@ function BillingAnalyticsTab() {
                   <tr className="border-b border-[var(--glass-border)]">
                     <th className="text-left text-xs text-muted-foreground py-2">{t('billing.analytics.nodeName')}</th>
                     <th className="text-left text-xs text-muted-foreground py-2">{t('billing.analytics.provider')}</th>
-                    <th className="text-center text-xs text-muted-foreground py-2">CPU</th>
-                    <th className="text-center text-xs text-muted-foreground py-2">RAM</th>
+                    <th className="text-center text-xs text-muted-foreground py-2">{t('billing.analytics.cpu')}</th>
+                    <th className="text-center text-xs text-muted-foreground py-2">{t('billing.analytics.ram')}</th>
                     <th className="text-right text-xs text-muted-foreground py-2">{t('billing.analytics.usersOnline')}</th>
                   </tr>
                 </thead>

@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Link, useLocation } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
@@ -37,7 +37,11 @@ import {
   ShieldBan,
   Package,
   FileJson,
-} from 'lucide-react'
+  Wallet,
+  FileText,
+  Boxes,
+  type LucideIcon,
+} from '@/components/brand/icons'
 import { useAuthStore } from '../../store/authStore'
 import { usePermissionStore } from '../../store/permissionStore'
 import { useAppearanceStore } from '../../store/useAppearanceStore'
@@ -58,14 +62,14 @@ interface NavItem {
   type?: 'item'
   name: string
   href: string
-  icon: typeof LayoutDashboard
+  icon: LucideIcon
   permission: { resource: string; action: string } | null
 }
 
 interface NavGroup {
   type: 'group'
   name: string
-  icon: typeof LayoutDashboard
+  icon: LucideIcon
   items: NavItem[]
 }
 
@@ -85,27 +89,33 @@ function isNavSection(entry: NavigationEntry): entry is NavSection {
 }
 
 const navigation: NavigationEntry[] = [
-  // Core
-  { type: 'section', name: 'nav.sections.core' },
+  // Overview — «смотрю на систему»
+  { type: 'section', name: 'nav.sections.overview' },
   { name: 'nav.dashboard', href: '/', icon: LayoutDashboard, permission: null },
+  { name: 'nav.analytics', href: '/analytics', icon: BarChart3, permission: { resource: 'analytics', action: 'view' } },
+  // People — «управляю людьми»
+  { type: 'section', name: 'nav.sections.people' },
   { name: 'nav.users', href: '/users', icon: Users, permission: { resource: 'users', action: 'view' } },
+  { name: 'nav.squads', href: '/squads', icon: UsersRound, permission: { resource: 'users', action: 'view' } },
+  // Infrastructure — «управляю железом и конфигурацией»
+  { type: 'section', name: 'nav.sections.infrastructure' },
   { name: 'nav.nodes', href: '/nodes', icon: Server, permission: { resource: 'nodes', action: 'view' } },
   { name: 'nav.fleet', href: '/fleet', icon: Activity, permission: { resource: 'fleet', action: 'view' } },
   { name: 'nav.hosts', href: '/hosts', icon: Globe, permission: { resource: 'hosts', action: 'view' } },
-  { name: 'nav.squads', href: '/squads', icon: UsersRound, permission: { resource: 'users', action: 'view' } },
-  // Security
+  { name: 'nav.billing', href: '/billing', icon: Wallet, permission: { resource: 'billing', action: 'view' } },
+  { name: 'nav.xrayEditor', href: '/resources/xray', icon: FileJson, permission: { resource: 'resources', action: 'view' } },
+  { name: 'nav.resources', href: '/resources', icon: Boxes, permission: { resource: 'resources', action: 'view' } },
+  // Security — «защищаюсь»
   { type: 'section', name: 'nav.sections.security' },
   { name: 'nav.violations', href: '/violations', icon: ShieldAlert, permission: { resource: 'violations', action: 'view' } },
   { name: 'nav.blocking', href: '/blocking', icon: ShieldBan, permission: { resource: 'blocked_ips', action: 'view' } },
+  { name: 'nav.reports', href: '/reports', icon: FileText, permission: { resource: 'reports', action: 'view' } },
+  // Services — «настраиваю реакции и каналы»
+  { type: 'section', name: 'nav.sections.services' },
   { name: 'nav.automations', href: '/automations', icon: Zap, permission: { resource: 'automation', action: 'view' } },
   { name: 'nav.notifications', href: '/notifications', icon: BellRing, permission: { resource: 'notifications', action: 'view' } },
   { name: 'nav.mailServer', href: '/mailserver', icon: Mail, permission: { resource: 'mailserver', action: 'view' } },
-  // Data
-  { type: 'section', name: 'nav.sections.data' },
-  { name: 'nav.analytics', href: '/analytics', icon: BarChart3, permission: { resource: 'analytics', action: 'view' } },
-  { name: 'nav.backups', href: '/backups', icon: HardDrive, permission: { resource: 'backups', action: 'view' } },
   { name: 'nav.apiKeys', href: '/api-keys', icon: Key, permission: { resource: 'api_keys', action: 'view' } },
-  { name: 'nav.xrayEditor', href: '/resources/xray', icon: FileJson, permission: { resource: 'resources', action: 'view' } },
   // Bedolaga
   { type: 'section', name: 'nav.sections.bedolaga' },
   {
@@ -131,6 +141,7 @@ const navigation: NavigationEntry[] = [
       { name: 'nav.audit', href: '/audit', icon: ClipboardList, permission: { resource: 'audit', action: 'view' } },
       { name: 'nav.adminPlugins', href: '/admin/plugins', icon: Package, permission: { resource: 'plugins', action: 'view' } },
       { name: 'nav.logs', href: '/logs', icon: Terminal, permission: { resource: 'logs', action: 'view' } },
+      { name: 'nav.backups', href: '/backups', icon: HardDrive, permission: { resource: 'backups', action: 'view' } },
     ],
   },
   { name: 'nav.settings', href: '/settings', icon: Settings, permission: { resource: 'settings', action: 'view' } },
@@ -191,7 +202,11 @@ export default function Sidebar({ mobileOpen, onClose }: SidebarProps) {
     staleTime: 60_000,
     retry: 1,
   })
-  const panelName = panelNameData?.panel_name || ''
+  const panelName = panelNameData?.panel_name || 'Remnawave Admin'
+
+  useEffect(() => {
+    document.title = panelName
+  }, [panelName])
 
   const handleNavClick = () => {
     if (onClose) onClose()
@@ -474,6 +489,8 @@ export default function Sidebar({ mobileOpen, onClose }: SidebarProps) {
       </div>
 
       {/* Project links */}
+      {role === 'superadmin' && (
+        <>
       <div className="mx-4 h-px bg-gradient-to-r from-transparent via-[rgba(var(--glow-rgb),0.12)] to-transparent" />
       <div className={cn("px-4 py-2 space-y-0.5", collapsed && "px-2")}>
         {collapsed ? (
@@ -550,6 +567,8 @@ export default function Sidebar({ mobileOpen, onClose }: SidebarProps) {
           </>
         )}
       </div>
+        </>
+      )}
 
       {/* User info */}
       <div className="mx-4 h-px bg-gradient-to-r from-transparent via-[rgba(var(--glow-rgb),0.12)] to-transparent" />

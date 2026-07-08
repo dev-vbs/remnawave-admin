@@ -9,6 +9,17 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from shared.db._base import _db_row_to_api_format
 
+from shared.db_schema import (
+    USERS_TABLE,
+    USER_BASELINES_TABLE,
+    USER_CONNECTIONS_TABLE,
+    USER_HWID_DEVICES_TABLE,
+    VIOLATIONS_TABLE,
+    VIOLATION_REPORTS_TABLE,
+    VIOLATION_WHITELIST_TABLE,
+)
+from shared.db_query import delete_sql, insert_sql, select_sql, update_sql
+
 from shared.logger import logger
 from shared.metrics import VIOLATIONS_DETECTED
 
@@ -49,49 +60,65 @@ class ViolationsMixin:
         hwid_matched_users: Optional[str] = None,
         user_agent_score: Optional[float] = None,
         suspicious_user_agents: Optional[str] = None,
-    ) -> Optional[int]:
+    ) -> Tuple[Optional[int], bool]:
         """
         Сохранить нарушение в базу данных.
 
         Returns:
-            ID созданной записи или None при ошибке
+            (ID записи, created): created=False — дедуп вернул существующую
+            pending-запись (или ошибка/нет БД). Downstream-события
+            (violation.created, автоблок) должны срабатывать только при created=True.
         """
         if not self.is_connected:
-            return None
+            return None, False
 
         try:
             async with self.acquire() as conn:
                 async with conn.transaction():
-                    # Deduplication: skip if user already has an unresolved violation
-                    existing = await conn.fetchval(
-                        "SELECT id FROM violations WHERE user_uuid = $1 "
-                        "AND action_taken IS NULL "
-                        "ORDER BY detected_at DESC LIMIT 1",
-                        user_uuid,
+                    # Deduplication: в пределах окна не плодим записи об одном инциденте.
+                    # Без окна старое pending-нарушение (вне выборки UI) глушило бы новые
+                    # записи вечно — уведомления идут, а во вкладке «Нарушения» пусто.
+                    # Эскалация: более высокий скор (напр. торрент=100) пробивает дедуп.
+                    try:
+                        from shared.config_service import config_service
+                        raw_window = config_service.get("violation_dedup_window_hours", 24)
+                        dedup_hours = int(raw_window) if raw_window is not None else 24
+                    except Exception:
+                        dedup_hours = 24
+
+                    existing = await conn.fetchrow(
+                        select_sql(
+                            VIOLATIONS_TABLE,
+                            "id, score",
+                            "WHERE user_uuid = $1 AND action_taken IS NULL "
+                            "AND detected_at > NOW() - ($2 * INTERVAL '1 hour') "
+                            "ORDER BY detected_at DESC LIMIT 1",
+                        ),
+                        user_uuid, dedup_hours,
                     )
-                    if existing:
-                        logger.debug("Skipping duplicate violation for user %s (pending id=%d)", user_uuid, existing)
-                        return existing
+                    if existing and float(existing["score"] or 0) >= score:
+                        logger.debug(
+                            "Skipping duplicate violation for user %s (pending id=%d, score %.1f >= %.1f)",
+                            user_uuid, existing["id"], float(existing["score"] or 0), score,
+                        )
+                        return existing["id"], False
 
                     result = await conn.fetchval(
-                        """
-                        INSERT INTO violations (
-                            user_uuid, username, email, telegram_id,
-                            score, recommended_action, confidence,
-                            temporal_score, geo_score, asn_score, profile_score, device_score,
-                            hwid_score, user_agent_score,
-                            ip_addresses, countries, cities, asn_types, os_list, client_list, reasons,
-                            simultaneous_connections, unique_ips_count, device_limit,
-                            impossible_travel, is_mobile, is_datacenter, is_vpn,
-                            raw_breakdown, hwid_matched_users, suspicious_user_agents, detected_at
-                        )
-                        VALUES (
-                            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                            $15, $16, $17, $18, $19, $20, $21, $22, $23, $24,
-                            $25, $26, $27, $28, $29, $30, $31, NOW()
-                        )
-                        RETURNING id
-                        """,
+                        insert_sql(
+                            VIOLATIONS_TABLE,
+                            [
+                                "user_uuid", "username", "email", "telegram_id",
+                                "score", "recommended_action", "confidence",
+                                "temporal_score", "geo_score", "asn_score", "profile_score", "device_score",
+                                "hwid_score", "user_agent_score",
+                                "ip_addresses", "countries", "cities", "asn_types", "os_list", "client_list", "reasons",
+                                "simultaneous_connections", "unique_ips_count", "device_limit",
+                                "impossible_travel", "is_mobile", "is_datacenter", "is_vpn",
+                                "raw_breakdown", "hwid_matched_users", "suspicious_user_agents", "detected_at",
+                            ],
+                            values="$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, NOW()",
+                            returning="id",
+                        ),
                         user_uuid, username, email, telegram_id,
                         score, recommended_action, confidence,
                         temporal_score, geo_score, asn_score, profile_score, device_score,
@@ -105,11 +132,11 @@ class ViolationsMixin:
                         VIOLATIONS_DETECTED.labels(
                             action=(recommended_action or "unknown").lower()
                         ).inc()
-                    return result
+                    return result, result is not None
 
         except Exception as e:
             logger.error("Error saving violation for user %s: %s", user_uuid, e, exc_info=True)
-            return None
+            return None, False
 
     async def get_violations_for_period(
         self,
@@ -128,6 +155,7 @@ class ViolationsMixin:
         recommended_action: Optional[str] = None,
         username: Optional[str] = None,
         user_uuid_whitelist: Optional[List[str]] = None,
+        include_annulled: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Получить нарушения за указанный период с фильтрацией на стороне БД.
@@ -165,12 +193,12 @@ class ViolationsMixin:
                 idx = 4
 
                 if user_uuid_whitelist is not None:
-                    conditions.append(f"user_uuid::text = ANY(${idx})")
+                    conditions.append(f"user_uuid = ANY(${idx}::uuid[])")
                     params.append(user_uuid_whitelist)
                     idx += 1
 
                 if user_uuid:
-                    conditions.append(f"user_uuid::text = ${idx}")
+                    conditions.append(f"user_uuid = ${idx}::uuid")
                     params.append(user_uuid)
                     idx += 1
 
@@ -190,6 +218,12 @@ class ViolationsMixin:
                         conditions.append("action_taken IS NOT NULL")
                     else:
                         conditions.append("action_taken IS NULL")
+
+                # Аннулированные — ложные срабатывания (score обнулён). По умолчанию
+                # скрыты, чтобы список совпадал со статистикой (та всегда исключает
+                # 'annulled'); показываются только по явному запросу include_annulled.
+                if not include_annulled:
+                    conditions.append("action_taken IS DISTINCT FROM 'annulled'")
 
                 if ip:
                     conditions.append(f"${idx} = ANY(ip_addresses)")
@@ -223,7 +257,7 @@ class ViolationsMixin:
                     rows = await conn.fetch(
                         f"""
                         SELECT *, COUNT(*) OVER (PARTITION BY user_uuid) AS _user_violation_count
-                        FROM violations
+                        FROM {VIOLATIONS_TABLE}
                         WHERE {where}
                         ORDER BY _user_violation_count {valid_order}, id ASC
                         LIMIT ${idx} OFFSET ${idx + 1}
@@ -233,7 +267,7 @@ class ViolationsMixin:
                 else:
                     rows = await conn.fetch(
                         f"""
-                        SELECT * FROM violations
+                        SELECT * FROM {VIOLATIONS_TABLE}
                         WHERE {where}
                         ORDER BY {valid_sort} {valid_order}, id ASC
                         LIMIT ${idx} OFFSET ${idx + 1}
@@ -259,6 +293,7 @@ class ViolationsMixin:
         recommended_action: Optional[str] = None,
         username: Optional[str] = None,
         user_uuid_whitelist: Optional[List[str]] = None,
+        include_annulled: bool = False,
     ) -> int:
         """Подсчитать количество нарушений за период с фильтрами (для пагинации)."""
         if not self.is_connected:
@@ -279,12 +314,12 @@ class ViolationsMixin:
                 idx = 4
 
                 if user_uuid_whitelist is not None:
-                    conditions.append(f"user_uuid::text = ANY(${idx})")
+                    conditions.append(f"user_uuid = ANY(${idx}::uuid[])")
                     params.append(user_uuid_whitelist)
                     idx += 1
 
                 if user_uuid:
-                    conditions.append(f"user_uuid::text = ${idx}")
+                    conditions.append(f"user_uuid = ${idx}::uuid")
                     params.append(user_uuid)
                     idx += 1
 
@@ -304,6 +339,11 @@ class ViolationsMixin:
                         conditions.append("action_taken IS NOT NULL")
                     else:
                         conditions.append("action_taken IS NULL")
+
+                # См. get_violations_for_period: аннулированные скрыты по умолчанию,
+                # иначе count списка расходится со статистикой.
+                if not include_annulled:
+                    conditions.append("action_taken IS DISTINCT FROM 'annulled'")
 
                 if ip:
                     conditions.append(f"${idx} = ANY(ip_addresses)")
@@ -327,7 +367,7 @@ class ViolationsMixin:
 
                 where = " AND ".join(conditions)
                 row = await conn.fetchval(
-                    f"SELECT COUNT(*) FROM violations WHERE {where}",
+                    select_sql(VIOLATIONS_TABLE, "COUNT(*)", f"WHERE {where}"),
                     *params
                 )
                 return row or 0
@@ -344,7 +384,7 @@ class ViolationsMixin:
         try:
             async with self.acquire() as conn:
                 row = await conn.fetchrow(
-                    "SELECT * FROM violations WHERE id = $1",
+                    select_sql(VIOLATIONS_TABLE, "*", "WHERE id = $1"),
                     violation_id
                 )
                 return dict(row) if row else None
@@ -379,7 +419,7 @@ class ViolationsMixin:
         try:
             async with self.acquire() as conn:
                 row = await conn.fetchrow(
-                    """
+                    f"""
                     SELECT
                         COUNT(*) as total,
                         COUNT(*) FILTER (WHERE score >= 80) as critical,
@@ -388,7 +428,7 @@ class ViolationsMixin:
                         COUNT(DISTINCT user_uuid) as unique_users,
                         COALESCE(AVG(score), 0) as avg_score,
                         COALESCE(MAX(score), 0) as max_score
-                    FROM violations
+                    FROM {VIOLATIONS_TABLE}
                     WHERE detected_at >= $1
                     AND detected_at < $2
                     AND score >= $3
@@ -399,8 +439,8 @@ class ViolationsMixin:
                 return dict(row) if row else {
                     'total': 0,
                     'critical': 0,
-                    'warning': 0,
-                    'monitor': 0,
+                    'high': 0,
+                    'medium': 0,
                     'unique_users': 0,
                     'avg_score': 0.0,
                     'max_score': 0.0
@@ -437,7 +477,7 @@ class ViolationsMixin:
         try:
             async with self.acquire() as conn:
                 rows = await conn.fetch(
-                    """
+                    f"""
                     SELECT
                         user_uuid,
                         MAX(username) as username,
@@ -448,7 +488,7 @@ class ViolationsMixin:
                         AVG(score) as avg_score,
                         MAX(detected_at) as last_violation_at,
                         ARRAY_AGG(DISTINCT recommended_action) as actions
-                    FROM violations
+                    FROM {VIOLATIONS_TABLE}
                     WHERE detected_at >= $1
                     AND detected_at < $2
                     AND score >= $3
@@ -480,12 +520,12 @@ class ViolationsMixin:
         try:
             async with self.acquire() as conn:
                 rows = await conn.fetch(
-                    """
+                    f"""
                     SELECT user_uuid::text, array_agg(DISTINCT reason) as reasons
                     FROM (
                         SELECT user_uuid, unnest(reasons) as reason
-                        FROM violations
-                        WHERE user_uuid::text = ANY($1)
+                        FROM {VIOLATIONS_TABLE}
+                        WHERE user_uuid = ANY($1::uuid[])
                         AND detected_at >= $2
                         AND detected_at < $3
                         AND score >= $4
@@ -522,11 +562,11 @@ class ViolationsMixin:
         try:
             async with self.acquire() as conn:
                 rows = await conn.fetch(
-                    """
+                    f"""
                     SELECT
                         UNNEST(countries) as country,
                         COUNT(*) as count
-                    FROM violations
+                    FROM {VIOLATIONS_TABLE}
                     WHERE detected_at >= $1
                     AND detected_at < $2
                     AND score >= $3
@@ -561,11 +601,11 @@ class ViolationsMixin:
         try:
             async with self.acquire() as conn:
                 rows = await conn.fetch(
-                    """
+                    f"""
                     SELECT
                         recommended_action,
                         COUNT(*) as count
-                    FROM violations
+                    FROM {VIOLATIONS_TABLE}
                     WHERE detected_at >= $1
                     AND detected_at < $2
                     AND score >= $3
@@ -599,11 +639,11 @@ class ViolationsMixin:
         try:
             async with self.acquire() as conn:
                 rows = await conn.fetch(
-                    """
+                    f"""
                     SELECT
                         UNNEST(asn_types) as asn_type,
                         COUNT(*) as count
-                    FROM violations
+                    FROM {VIOLATIONS_TABLE}
                     WHERE detected_at >= $1
                     AND detected_at < $2
                     AND score >= $3
@@ -644,11 +684,11 @@ class ViolationsMixin:
         try:
             async with self.acquire() as conn:
                 row = await conn.fetchrow(
-                    """
-                    SELECT COUNT(*) as cnt FROM violations
-                    WHERE user_uuid = $1
-                    AND detected_at > NOW() - make_interval(hours => $2)
-                    """,
+                    select_sql(
+                        VIOLATIONS_TABLE,
+                        "COUNT(*) as cnt",
+                        "WHERE user_uuid = $1 AND detected_at > NOW() - make_interval(hours => $2)",
+                    ),
                     user_uuid, int(hours)
                 )
                 return row['cnt'] if row else 0
@@ -680,13 +720,11 @@ class ViolationsMixin:
         try:
             async with self.acquire() as conn:
                 rows = await conn.fetch(
-                    """
-                    SELECT * FROM violations
-                    WHERE user_uuid = $1
-                    AND detected_at > NOW() - make_interval(days => $2)
-                    ORDER BY detected_at DESC, id ASC
-                    LIMIT $3
-                    """,
+                    select_sql(
+                        VIOLATIONS_TABLE,
+                        "*",
+                        "WHERE user_uuid = $1 AND detected_at > NOW() - make_interval(days => $2) ORDER BY detected_at DESC, id ASC LIMIT $3",
+                    ),
                     user_uuid, int(days), limit
                 )
                 return [dict(row) for row in rows]
@@ -722,33 +760,24 @@ class ViolationsMixin:
                 if action_taken == "annulled":
                     # При аннулировании обнуляем скор — ложное срабатывание
                     result = await conn.execute(
-                        """
-                        UPDATE violations
-                        SET action_taken = $1,
-                            action_taken_at = NOW(),
-                            action_taken_by = $2,
-                            admin_comment = $3,
-                            score = 0,
-                            temporal_score = 0,
-                            geo_score = 0,
-                            asn_score = 0,
-                            profile_score = 0,
-                            device_score = 0,
-                            hwid_score = 0
-                        WHERE id = $4
-                        """,
+                        update_sql(
+                            VIOLATIONS_TABLE,
+                            "action_taken = $1, action_taken_at = NOW(), action_taken_by = $2, "
+                            "admin_comment = $3, score = 0, temporal_score = 0, geo_score = 0, "
+                            "asn_score = 0, profile_score = 0, device_score = 0, hwid_score = 0, "
+                            "user_agent_score = 0",
+                            "id = $4",
+                        ),
                         action_taken, admin_telegram_id, admin_comment, violation_id
                     )
                 else:
                     result = await conn.execute(
-                        """
-                        UPDATE violations
-                        SET action_taken = $1,
-                            action_taken_at = NOW(),
-                            action_taken_by = $2,
-                            admin_comment = $3
-                        WHERE id = $4
-                        """,
+                        update_sql(
+                            VIOLATIONS_TABLE,
+                            "action_taken = $1, action_taken_at = NOW(), "
+                            "action_taken_by = $2, admin_comment = $3",
+                            "id = $4",
+                        ),
                         action_taken, admin_telegram_id, admin_comment, violation_id
                     )
                 return result == "UPDATE 1"
@@ -775,22 +804,14 @@ class ViolationsMixin:
         try:
             async with self.acquire() as conn:
                 result = await conn.execute(
-                    """
-                    UPDATE violations
-                    SET action_taken = 'annulled',
-                        action_taken_at = NOW(),
-                        action_taken_by = $1,
-                        admin_comment = $2,
-                        score = 0,
-                        temporal_score = 0,
-                        geo_score = 0,
-                        asn_score = 0,
-                        profile_score = 0,
-                        device_score = 0,
-                        hwid_score = 0
-                    WHERE user_uuid = $3
-                      AND action_taken IS NULL
-                    """,
+                    update_sql(
+                        VIOLATIONS_TABLE,
+                        "action_taken = 'annulled', action_taken_at = NOW(), action_taken_by = $1, "
+                        "admin_comment = $2, score = 0, temporal_score = 0, geo_score = 0, "
+                        "asn_score = 0, profile_score = 0, device_score = 0, hwid_score = 0, "
+                        "user_agent_score = 0",
+                        "user_uuid = $3 AND action_taken IS NULL",
+                    ),
                     admin_telegram_id, admin_comment, user_uuid,
                 )
                 # result format: "UPDATE N"
@@ -818,21 +839,14 @@ class ViolationsMixin:
         try:
             async with self.acquire() as conn:
                 result = await conn.execute(
-                    """
-                    UPDATE violations
-                    SET action_taken = 'annulled',
-                        action_taken_at = NOW(),
-                        action_taken_by = $1,
-                        admin_comment = $2,
-                        score = 0,
-                        temporal_score = 0,
-                        geo_score = 0,
-                        asn_score = 0,
-                        profile_score = 0,
-                        device_score = 0,
-                        hwid_score = 0
-                    WHERE action_taken IS NULL
-                    """,
+                    update_sql(
+                        VIOLATIONS_TABLE,
+                        "action_taken = 'annulled', action_taken_at = NOW(), action_taken_by = $1, "
+                        "admin_comment = $2, score = 0, temporal_score = 0, geo_score = 0, "
+                        "asn_score = 0, profile_score = 0, device_score = 0, hwid_score = 0, "
+                        "user_agent_score = 0",
+                        "action_taken IS NULL",
+                    ),
                     admin_telegram_id, admin_comment,
                 )
                 count = int(result.split()[-1]) if result else 0
@@ -850,11 +864,11 @@ class ViolationsMixin:
         try:
             async with self.acquire() as conn:
                 result = await conn.execute(
-                    """
-                    UPDATE violations
-                    SET notified_at = NOW()
-                    WHERE id = $1
-                    """,
+                    update_sql(
+                        VIOLATIONS_TABLE,
+                        "notified_at = NOW()",
+                        "id = $1",
+                    ),
                     violation_id
                 )
                 return result == "UPDATE 1"
@@ -871,7 +885,11 @@ class ViolationsMixin:
         try:
             async with self.acquire() as conn:
                 row = await conn.fetchval(
-                    "SELECT MAX(notified_at) FROM violations WHERE user_uuid = $1 AND notified_at IS NOT NULL",
+                    select_sql(
+                        VIOLATIONS_TABLE,
+                        "MAX(notified_at)",
+                        "WHERE user_uuid = $1 AND notified_at IS NOT NULL",
+                    ),
                     user_uuid
                 )
                 return row
@@ -888,10 +906,11 @@ class ViolationsMixin:
         try:
             async with self.acquire() as conn:
                 await conn.execute(
-                    """
-                    UPDATE violations SET notified_at = NOW()
-                    WHERE user_uuid = $1 AND notified_at IS NULL AND action_taken IS NULL
-                    """,
+                    update_sql(
+                        VIOLATIONS_TABLE,
+                        "notified_at = NOW()",
+                        "user_uuid = $1 AND notified_at IS NULL AND action_taken IS NULL",
+                    ),
                     user_uuid
                 )
 
@@ -913,10 +932,10 @@ class ViolationsMixin:
             for _ in range(max_batches):
                 async with self.acquire() as conn:
                     result = await conn.execute(
-                        """
-                        DELETE FROM violations
+                        f"""
+                        DELETE FROM {VIOLATIONS_TABLE}
                         WHERE id IN (
-                            SELECT id FROM violations
+                            SELECT id FROM {VIOLATIONS_TABLE}
                             WHERE action_taken IS NOT NULL
                               AND detected_at < NOW() - make_interval(days => $1)
                             ORDER BY detected_at
@@ -979,11 +998,11 @@ class ViolationsMixin:
         try:
             async with self.acquire() as conn:
                 row = await conn.fetchrow(
-                    """
-                    SELECT excluded_analyzers FROM violation_whitelist
-                    WHERE user_uuid = $1
-                    AND (expires_at IS NULL OR expires_at > NOW())
-                    """,
+                    select_sql(
+                        VIOLATION_WHITELIST_TABLE,
+                        "excluded_analyzers",
+                        "WHERE user_uuid = $1 AND (expires_at IS NULL OR expires_at > NOW())",
+                    ),
                     user_uuid,
                 )
                 self._whitelist_table_available = True
@@ -1014,11 +1033,11 @@ class ViolationsMixin:
         try:
             async with self.acquire() as conn:
                 row = await conn.fetchval(
-                    """
-                    SELECT 1 FROM violation_whitelist
-                    WHERE user_uuid = $1
-                    AND (expires_at IS NULL OR expires_at > NOW())
-                    """,
+                    select_sql(
+                        VIOLATION_WHITELIST_TABLE,
+                        "1",
+                        "WHERE user_uuid = $1 AND (expires_at IS NULL OR expires_at > NOW())",
+                    ),
                     user_uuid,
                 )
                 result = (row is not None, None) if row else (False, None)
@@ -1052,18 +1071,17 @@ class ViolationsMixin:
         try:
             async with self.acquire() as conn:
                 await conn.execute(
-                    """
-                    INSERT INTO violation_whitelist
-                        (user_uuid, reason, added_by_admin_id, added_by_username, expires_at, excluded_analyzers)
-                    VALUES ($1, $2, $3, $4, $5, $6)
-                    ON CONFLICT (user_uuid) DO UPDATE SET
-                        reason = EXCLUDED.reason,
-                        added_by_admin_id = EXCLUDED.added_by_admin_id,
-                        added_by_username = EXCLUDED.added_by_username,
-                        added_at = NOW(),
-                        expires_at = EXCLUDED.expires_at,
-                        excluded_analyzers = EXCLUDED.excluded_analyzers
-                    """,
+                    insert_sql(
+                        VIOLATION_WHITELIST_TABLE,
+                        ["user_uuid", "reason", "added_by_admin_id", "added_by_username", "expires_at", "excluded_analyzers"],
+                        suffix="ON CONFLICT (user_uuid) DO UPDATE SET "
+                        "reason = EXCLUDED.reason, "
+                        "added_by_admin_id = EXCLUDED.added_by_admin_id, "
+                        "added_by_username = EXCLUDED.added_by_username, "
+                        "added_at = NOW(), "
+                        "expires_at = EXCLUDED.expires_at, "
+                        "excluded_analyzers = EXCLUDED.excluded_analyzers",
+                    ),
                     user_uuid, reason, admin_id, admin_username, expires_at, excluded_analyzers,
                 )
                 # Invalidate cache
@@ -1081,17 +1099,16 @@ class ViolationsMixin:
                 try:
                     async with self.acquire() as conn:
                         await conn.execute(
-                            """
-                            INSERT INTO violation_whitelist
-                                (user_uuid, reason, added_by_admin_id, added_by_username, expires_at)
-                            VALUES ($1, $2, $3, $4, $5)
-                            ON CONFLICT (user_uuid) DO UPDATE SET
-                                reason = EXCLUDED.reason,
-                                added_by_admin_id = EXCLUDED.added_by_admin_id,
-                                added_by_username = EXCLUDED.added_by_username,
-                                added_at = NOW(),
-                                expires_at = EXCLUDED.expires_at
-                            """,
+                            insert_sql(
+                                VIOLATION_WHITELIST_TABLE,
+                                ["user_uuid", "reason", "added_by_admin_id", "added_by_username", "expires_at"],
+                                suffix="ON CONFLICT (user_uuid) DO UPDATE SET "
+                                "reason = EXCLUDED.reason, "
+                                "added_by_admin_id = EXCLUDED.added_by_admin_id, "
+                                "added_by_username = EXCLUDED.added_by_username, "
+                                "added_at = NOW(), "
+                                "expires_at = EXCLUDED.expires_at",
+                            ),
                             user_uuid, reason, admin_id, admin_username, expires_at,
                         )
                         self._whitelist_cache.pop(user_uuid, None)
@@ -1123,11 +1140,11 @@ class ViolationsMixin:
         try:
             async with self.acquire() as conn:
                 result = await conn.execute(
-                    """
-                    UPDATE violation_whitelist
-                    SET excluded_analyzers = $2
-                    WHERE user_uuid = $1
-                    """,
+                    update_sql(
+                        VIOLATION_WHITELIST_TABLE,
+                        "excluded_analyzers = $2",
+                        "user_uuid = $1",
+                    ),
                     user_uuid, excluded_analyzers,
                 )
                 self._whitelist_cache.pop(user_uuid, None)
@@ -1144,7 +1161,7 @@ class ViolationsMixin:
         try:
             async with self.acquire() as conn:
                 result = await conn.execute(
-                    "DELETE FROM violation_whitelist WHERE user_uuid = $1",
+                    delete_sql(VIOLATION_WHITELIST_TABLE, "user_uuid = $1"),
                     user_uuid,
                 )
                 # Invalidate cache
@@ -1166,23 +1183,13 @@ class ViolationsMixin:
         try:
             async with self.acquire() as conn:
                 rows = await conn.fetch(
-                    """
-                    SELECT
-                        w.id,
-                        w.user_uuid,
-                        w.reason,
-                        w.added_by_admin_id,
-                        w.added_by_username,
-                        w.added_at,
-                        w.expires_at,
-                        w.excluded_analyzers,
-                        u.username,
-                        u.email
-                    FROM violation_whitelist w
-                    LEFT JOIN users u ON u.uuid = w.user_uuid
-                    ORDER BY w.added_at DESC
-                    LIMIT $1 OFFSET $2
-                    """,
+                    select_sql(
+                        VIOLATION_WHITELIST_TABLE,
+                        "w.id, w.user_uuid, w.reason, w.added_by_admin_id, w.added_by_username, "
+                        "w.added_at, w.expires_at, w.excluded_analyzers, u.username, u.email",
+                        "w LEFT JOIN users u ON u.uuid = w.user_uuid "
+                        "ORDER BY w.added_at DESC LIMIT $1 OFFSET $2",
+                    ),
                     limit, offset,
                 )
                 return [dict(row) for row in rows]
@@ -1197,7 +1204,7 @@ class ViolationsMixin:
 
         try:
             async with self.acquire() as conn:
-                row = await conn.fetchval("SELECT COUNT(*) FROM violation_whitelist")
+                row = await conn.fetchval(select_sql(VIOLATION_WHITELIST_TABLE, "COUNT(*)"))
                 return row or 0
         except Exception as e:
             logger.error("Error getting violation whitelist count: %s", e, exc_info=True)
@@ -1235,17 +1242,18 @@ class ViolationsMixin:
         try:
             async with self.acquire() as conn:
                 result = await conn.fetchval(
-                    """
-                    INSERT INTO violation_reports (
-                        report_type, period_start, period_end,
-                        total_violations, critical_count, warning_count, monitor_count, unique_users,
-                        prev_total_violations, trend_percent,
-                        top_violators, by_country, by_action, by_asn_type,
-                        message_text, generated_at
-                    )
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, NOW())
-                    RETURNING id
-                    """,
+                    insert_sql(
+                        VIOLATION_REPORTS_TABLE,
+                        [
+                            "report_type", "period_start", "period_end",
+                            "total_violations", "critical_count", "warning_count", "monitor_count", "unique_users",
+                            "prev_total_violations", "trend_percent",
+                            "top_violators", "by_country", "by_action", "by_asn_type",
+                            "message_text", "generated_at",
+                        ],
+                        values="$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, NOW()",
+                        returning="id",
+                    ),
                     report_type, period_start, period_end,
                     total_violations, critical_count, warning_count, monitor_count, unique_users,
                     prev_total_violations, trend_percent,
@@ -1266,11 +1274,11 @@ class ViolationsMixin:
         try:
             async with self.acquire() as conn:
                 result = await conn.execute(
-                    """
-                    UPDATE violation_reports
-                    SET sent_at = NOW()
-                    WHERE id = $1
-                    """,
+                    update_sql(
+                        VIOLATION_REPORTS_TABLE,
+                        "sent_at = NOW()",
+                        "id = $1",
+                    ),
                     report_id
                 )
                 return result == "UPDATE 1"
@@ -1295,12 +1303,11 @@ class ViolationsMixin:
         try:
             async with self.acquire() as conn:
                 row = await conn.fetchrow(
-                    """
-                    SELECT * FROM violation_reports
-                    WHERE report_type = $1
-                    ORDER BY period_end DESC
-                    LIMIT 1
-                    """,
+                    select_sql(
+                        VIOLATION_REPORTS_TABLE,
+                        "*",
+                        "WHERE report_type = $1 ORDER BY period_end DESC LIMIT 1",
+                    ),
                     report_type
                 )
                 return dict(row) if row else None
@@ -1331,21 +1338,20 @@ class ViolationsMixin:
             async with self.acquire() as conn:
                 if report_type:
                     rows = await conn.fetch(
-                        """
-                        SELECT * FROM violation_reports
-                        WHERE report_type = $1
-                        ORDER BY period_end DESC
-                        LIMIT $2
-                        """,
+                        select_sql(
+                            VIOLATION_REPORTS_TABLE,
+                            "*",
+                            "WHERE report_type = $1 ORDER BY period_end DESC LIMIT $2",
+                        ),
                         report_type, limit
                     )
                 else:
                     rows = await conn.fetch(
-                        """
-                        SELECT * FROM violation_reports
-                        ORDER BY period_end DESC
-                        LIMIT $1
-                        """,
+                        select_sql(
+                            VIOLATION_REPORTS_TABLE,
+                            "*",
+                            "ORDER BY period_end DESC LIMIT $1",
+                        ),
                         limit
                     )
                 return [dict(row) for row in rows]
@@ -1390,12 +1396,11 @@ class ViolationsMixin:
         try:
             async with self.acquire() as conn:
                 rows = await conn.fetch(
-                    """
-                    SELECT user_uuid::text, excluded_analyzers
-                    FROM violation_whitelist
-                    WHERE user_uuid = ANY($1::uuid[])
-                      AND (expires_at IS NULL OR expires_at > NOW())
-                    """,
+                    select_sql(
+                        VIOLATION_WHITELIST_TABLE,
+                        "user_uuid::text, excluded_analyzers",
+                        "WHERE user_uuid = ANY($1::uuid[]) AND (expires_at IS NULL OR expires_at > NOW())",
+                    ),
                     to_fetch,
                 )
             found = set()
@@ -1432,7 +1437,7 @@ class ViolationsMixin:
         try:
             async with self.acquire() as conn:
                 rows = await conn.fetch(
-                    "SELECT uuid::text, raw_data FROM users WHERE uuid = ANY($1::uuid[])",
+                    select_sql(USERS_TABLE, "uuid::text, raw_data", "WHERE uuid = ANY($1::uuid[])"),
                     user_uuids,
                 )
 
@@ -1477,14 +1482,13 @@ class ViolationsMixin:
         try:
             async with self.acquire() as conn:
                 rows = await conn.fetch(
-                    """
-                    SELECT id, user_uuid, ip_address, node_uuid, connected_at, device_info
-                    FROM user_connections
-                    WHERE user_uuid = ANY($1::uuid[])
-                      AND disconnected_at IS NULL
-                      AND connected_at > NOW() - make_interval(mins => $2)
-                    ORDER BY user_uuid, connected_at DESC
-                    """,
+                    select_sql(
+                        USER_CONNECTIONS_TABLE,
+                        "id, user_uuid, ip_address, node_uuid, connected_at, device_info",
+                        "WHERE user_uuid = ANY($1::uuid[]) AND disconnected_at IS NULL "
+                        "AND connected_at > NOW() - make_interval(mins => $2) "
+                        "ORDER BY user_uuid, connected_at DESC",
+                    ),
                     user_uuids, max_age_minutes,
                 )
 
@@ -1507,12 +1511,12 @@ class ViolationsMixin:
         try:
             async with self.acquire() as conn:
                 rows = await conn.fetch(
-                    """
+                    f"""
                     SELECT sub.* FROM unnest($1::text[]) AS t(uid)
                     CROSS JOIN LATERAL (
                         SELECT id, user_uuid, ip_address, node_uuid,
                                connected_at, disconnected_at, device_info
-                        FROM user_connections
+                        FROM {USER_CONNECTIONS_TABLE}
                         WHERE user_uuid = t.uid::uuid
                           AND connected_at > NOW() - make_interval(days => $2)
                         ORDER BY connected_at DESC
@@ -1541,15 +1545,14 @@ class ViolationsMixin:
         try:
             async with self.acquire() as conn:
                 rows = await conn.fetch(
-                    """
-                    SELECT user_uuid::text, typical_countries, typical_cities,
-                           typical_regions, typical_asns, known_ips,
-                           avg_daily_unique_ips, max_daily_unique_ips,
-                           typical_hours, avg_session_duration_min, data_points
-                    FROM user_baselines
-                    WHERE user_uuid = ANY($1::uuid[])
-                      AND computed_at > NOW() - make_interval(secs => $2)
-                    """,
+                    select_sql(
+                        USER_BASELINES_TABLE,
+                        "user_uuid::text, typical_countries, typical_cities, "
+                        "typical_regions, typical_asns, known_ips, "
+                        "avg_daily_unique_ips, max_daily_unique_ips, "
+                        "typical_hours, avg_session_duration_min, data_points",
+                        "WHERE user_uuid = ANY($1::uuid[]) AND computed_at > NOW() - make_interval(secs => $2)",
+                    ),
                     user_uuids, max_age_seconds,
                 )
 
@@ -1583,17 +1586,17 @@ class ViolationsMixin:
         try:
             async with self.acquire() as conn:
                 rows = await conn.fetch(
-                    """
+                    f"""
                     SELECT h1.user_uuid::text AS source_uuid,
                            h2.hwid,
                            u.uuid::text AS user_uuid,
                            u.username, u.status, u.telegram_id,
                            me.telegram_id AS self_telegram_id
-                    FROM user_hwid_devices h1
-                    JOIN users me ON me.uuid = h1.user_uuid
-                    JOIN user_hwid_devices h2
+                    FROM {USER_HWID_DEVICES_TABLE} h1
+                    JOIN {USERS_TABLE} me ON me.uuid = h1.user_uuid
+                    JOIN {USER_HWID_DEVICES_TABLE} h2
                       ON h1.hwid = h2.hwid AND h2.user_uuid != h1.user_uuid
-                    JOIN users u ON h2.user_uuid = u.uuid
+                    JOIN {USERS_TABLE} u ON h2.user_uuid = u.uuid
                     WHERE h1.user_uuid = ANY($1::uuid[])
                     ORDER BY h1.user_uuid, h2.hwid, u.username
                     """,
@@ -1637,14 +1640,13 @@ class ViolationsMixin:
         try:
             async with self.acquire() as conn:
                 rows = await conn.fetch(
-                    """
-                    SELECT user_uuid::text, hwid, platform, os_version,
-                           device_model, app_version, user_agent,
-                           created_at, updated_at
-                    FROM user_hwid_devices
-                    WHERE user_uuid = ANY($1::uuid[])
-                    ORDER BY user_uuid, created_at DESC
-                    """,
+                    select_sql(
+                        USER_HWID_DEVICES_TABLE,
+                        "user_uuid::text, hwid, platform, os_version, "
+                        "device_model, app_version, user_agent, "
+                        "created_at, updated_at",
+                        "WHERE user_uuid = ANY($1::uuid[]) ORDER BY user_uuid, created_at DESC",
+                    ),
                     user_uuids,
                 )
 
@@ -1667,7 +1669,7 @@ class ViolationsMixin:
         try:
             async with self.acquire() as conn:
                 rows = await conn.fetch(
-                    "SELECT * FROM users WHERE uuid = ANY($1::uuid[])",
+                    select_sql(USERS_TABLE, "*", "WHERE uuid = ANY($1::uuid[])"),
                     user_uuids,
                 )
             return {

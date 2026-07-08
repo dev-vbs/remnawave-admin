@@ -12,23 +12,25 @@ from web.backend.api.deps import (
     require_superadmin,
     get_client_ip,
 )
-from web.backend.core.rbac import (
+from web.backend.core.admin_accounts import (
     create_admin_account,
     update_admin_account,
     delete_admin_account,
     list_admin_accounts,
     get_admin_account_by_id,
     get_admin_account_by_username,
-    get_role_by_id,
-    write_audit_log,
-    get_audit_logs,
+    reset_admin_counter,
 )
+from web.backend.core.audit import write_audit_log, get_audit_logs
+from web.backend.core.rbac import get_role_by_id
+from shared.rbac import get_all_permissions_for_role_id
 from web.backend.core.admin_credentials import hash_password, validate_password_strength
 from web.backend.schemas.admin import (
     AdminAccountCreate,
     AdminAccountUpdate,
     AdminAccountResponse,
     AdminAccountListResponse,
+    CounterResetRequest,
     AuditLogEntry,
     AuditLogResponse,
 )
@@ -52,6 +54,9 @@ def _account_to_response(account: dict) -> AdminAccountResponse:
         max_traffic_gb=account.get("max_traffic_gb"),
         max_nodes=account.get("max_nodes"),
         max_hosts=account.get("max_hosts"),
+        unlimited_traffic_policy=account.get("unlimited_traffic_policy", "allowed"),
+        unrestricted_user_access=account.get("unrestricted_user_access", True),
+        has_bot_access=account.get("has_bot_access", False),
         users_created=account.get("users_created", 0),
         traffic_used_bytes=account.get("traffic_used_bytes", 0),
         nodes_created=account.get("nodes_created", 0),
@@ -68,7 +73,21 @@ def _account_to_response(account: dict) -> AdminAccountResponse:
 async def list_admins(
     admin: AdminUser = Depends(require_permission("admins", "view")),
 ):
-    """List all admin accounts."""
+    """List all admin accounts. Also allowed for unrestricted_user_access admins."""
+    accounts = await list_admin_accounts()
+    return AdminAccountListResponse(
+        items=[_account_to_response(a) for a in accounts],
+        total=len(accounts),
+    )
+
+
+@router.get("/me", response_model=AdminAccountListResponse)
+async def list_admins_for_filter(
+    admin: AdminUser = Depends(get_current_admin),
+):
+    """Lightweight admin list for filter dropdown (allowed for unrestricted_user_access)."""
+    if not (admin.role == "superadmin" or getattr(admin, "unrestricted_user_access", False)):
+        raise api_error(403, E.FORBIDDEN)
     accounts = await list_admin_accounts()
     return AdminAccountListResponse(
         items=[_account_to_response(a) for a in accounts],
@@ -88,6 +107,39 @@ async def get_admin(
     return _account_to_response(account)
 
 
+def _actor_is_superadmin(admin: AdminUser) -> bool:
+    # Legacy env-admin (account_id is None) резолвится как superadmin в deps.
+    return admin.role == "superadmin" or admin.account_id is None
+
+
+async def _assert_can_assign_role(admin: AdminUser, role_id: int) -> None:
+    """Запрещает не-superadmin назначать роль superadmin или роль с правами
+    шире собственных (privilege escalation через admins:create/edit)."""
+    if _actor_is_superadmin(admin):
+        return
+    role = await get_role_by_id(role_id)
+    if role and role.get("name") == "superadmin":
+        raise api_error(403, E.FORBIDDEN, "Only a superadmin can assign the superadmin role")
+    target_perms = await get_all_permissions_for_role_id(role_id)
+    if target_perms - admin.permissions:
+        raise api_error(403, E.FORBIDDEN, "Cannot assign a role with permissions you do not hold")
+
+
+async def _assert_can_manage_target(admin: AdminUser, target: dict) -> None:
+    """Запрещает не-superadmin редактировать/удалять аккаунт, чья роль выше его
+    прав — иначе можно сменить пароль вышестоящему аккаунту и войти под ним."""
+    if _actor_is_superadmin(admin):
+        return
+    if target.get("role_name") == "superadmin":
+        raise api_error(403, E.FORBIDDEN, "Cannot manage a superadmin account")
+    target_role_id = target.get("role_id")
+    if target_role_id is None:
+        return
+    target_perms = await get_all_permissions_for_role_id(target_role_id)
+    if target_perms - admin.permissions:
+        raise api_error(403, E.FORBIDDEN, "Cannot manage an account whose role exceeds your permissions")
+
+
 @router.post("", response_model=AdminAccountResponse, status_code=201)
 async def create_admin(
     request: Request,
@@ -99,6 +151,9 @@ async def create_admin(
     role = await get_role_by_id(data.role_id)
     if not role:
         raise api_error(400, E.ROLE_NOT_FOUND)
+
+    # Privilege-escalation guard: can't grant a role above the actor's own.
+    await _assert_can_assign_role(admin, data.role_id)
 
     # Check username uniqueness
     existing = await get_admin_account_by_username(data.username)
@@ -122,6 +177,9 @@ async def create_admin(
         max_traffic_gb=data.max_traffic_gb,
         max_nodes=data.max_nodes,
         max_hosts=data.max_hosts,
+        unlimited_traffic_policy=data.unlimited_traffic_policy,
+        unrestricted_user_access=data.unrestricted_user_access,
+        has_bot_access=data.has_bot_access,
         is_generated_password=bool(pw_hash),
         created_by=admin.account_id,
         email=data.email,
@@ -157,9 +215,17 @@ async def update_admin(
     if not existing:
         raise api_error(404, E.ADMIN_NOT_FOUND)
 
+    # Can't edit an account whose role outranks the actor (else a non-superadmin
+    # could reset a superadmin's password/role and take it over).
+    if admin.account_id != admin_id:
+        await _assert_can_manage_target(admin, existing)
+
     # Cannot edit own role / deactivate self
     if admin.account_id == admin_id:
-        if data.role_id is not None and data.role_id != existing.get("role_id"):
+        # model_fields_set catches an explicit null too — otherwise a null role_id
+        # (e.g. frontend sending NaN→null) would slip past and blank out the role,
+        # silently demoting the only superadmin to a roleless "admin".
+        if "role_id" in data.model_fields_set and data.role_id != existing.get("role_id"):
             raise api_error(400, E.CANNOT_MODIFY_SELF, "Cannot change your own role")
         if data.is_active is not None and not data.is_active:
             raise api_error(400, E.CANNOT_MODIFY_SELF, "Cannot deactivate yourself")
@@ -171,25 +237,53 @@ async def update_admin(
         if dup and dup["id"] != admin_id:
             raise api_error(409, E.USERNAME_EXISTS)
         fields["username"] = data.username
-    if data.telegram_id is not None:
+    if data.telegram_id is not None or "telegram_id" in data.model_fields_set:
+        # Use model_fields_set to distinguish "not provided" from "explicitly null"
+        # so the frontend can clear an existing value by sending null.
+        if data.telegram_id is not None and not (1 <= data.telegram_id <= 9_999_999_999):
+            raise api_error(400, E.INVALID_TELEGRAM_ID)
         fields["telegram_id"] = data.telegram_id
-    if data.role_id is not None:
+    if data.role_id is not None or "role_id" in data.model_fields_set:
+        # role_id must never be cleared — an admin without a role loses all RBAC
+        # resolution (deps.py falls back to "admin"), which would silently strip a
+        # superadmin of their rights. Reject an explicit null outright.
+        if data.role_id is None:
+            raise api_error(400, E.ROLE_NOT_FOUND, "role_id cannot be cleared")
         role = await get_role_by_id(data.role_id)
         if not role:
             raise api_error(400, E.ROLE_NOT_FOUND)
+        # Privilege-escalation guard: can't promote to a role above the actor's own.
+        await _assert_can_assign_role(admin, data.role_id)
         fields["role_id"] = data.role_id
-    if data.max_users is not None:
+    # For numeric quota fields, accept null as "clear" (set to NULL → unlimited).
+    if data.max_users is not None or "max_users" in data.model_fields_set:
+        if data.max_users is not None and data.max_users < 0:
+            raise api_error(400, E.INVALID_INPUT, "max_users must be >= 0")
         fields["max_users"] = data.max_users
-    if data.max_traffic_gb is not None:
+    if data.max_traffic_gb is not None or "max_traffic_gb" in data.model_fields_set:
+        if data.max_traffic_gb is not None and data.max_traffic_gb < 0:
+            raise api_error(400, E.INVALID_INPUT, "max_traffic_gb must be >= 0")
         fields["max_traffic_gb"] = data.max_traffic_gb
-    if data.max_nodes is not None:
+    if data.max_nodes is not None or "max_nodes" in data.model_fields_set:
+        if data.max_nodes is not None and data.max_nodes < 0:
+            raise api_error(400, E.INVALID_INPUT, "max_nodes must be >= 0")
         fields["max_nodes"] = data.max_nodes
-    if data.max_hosts is not None:
+    if data.max_hosts is not None or "max_hosts" in data.model_fields_set:
+        if data.max_hosts is not None and data.max_hosts < 0:
+            raise api_error(400, E.INVALID_INPUT, "max_hosts must be >= 0")
         fields["max_hosts"] = data.max_hosts
     if data.is_active is not None:
         fields["is_active"] = data.is_active
-    if data.email is not None:
+    if data.email is not None or "email" in data.model_fields_set:
         fields["email"] = data.email or None
+    if data.unlimited_traffic_policy is not None:
+        if data.unlimited_traffic_policy not in ("allowed", "disabled", "enforced"):
+            raise api_error(400, E.INVALID_INPUT, "Policy must be one of: allowed, disabled, enforced")
+        fields["unlimited_traffic_policy"] = data.unlimited_traffic_policy
+    if data.unrestricted_user_access is not None:
+        fields["unrestricted_user_access"] = data.unrestricted_user_access
+    if data.has_bot_access is not None:
+        fields["has_bot_access"] = data.has_bot_access
     if data.password is not None:
         is_strong, error = validate_password_strength(data.password)
         if not is_strong:
@@ -230,6 +324,9 @@ async def delete_admin_endpoint(
     if not existing:
         raise api_error(404, E.ADMIN_NOT_FOUND)
 
+    # Can't delete an account whose role outranks the actor.
+    await _assert_can_manage_target(admin, existing)
+
     success = await delete_admin_account(admin_id)
     if not success:
         raise api_error(500, E.ADMIN_DELETE_FAILED)
@@ -246,6 +343,39 @@ async def delete_admin_endpoint(
     )
 
     return SuccessResponse(message="Admin account deleted")
+
+
+@router.post("/{admin_id}/counters/reset", response_model=AdminAccountResponse)
+async def reset_admin_counter_endpoint(
+    admin_id: int,
+    request: Request,
+    data: CounterResetRequest,
+    admin: AdminUser = Depends(require_permission("admins", "edit")),
+):
+    """Reset a specific usage counter for an admin account."""
+    valid_counters = ("users_created", "nodes_created", "hosts_created", "traffic_used_bytes")
+    if data.counter not in valid_counters:
+        raise api_error(400, E.INVALID_INPUT, f"counter must be one of: {', '.join(valid_counters)}")
+
+    existing = await get_admin_account_by_id(admin_id)
+    if not existing:
+        raise api_error(404, E.ADMIN_NOT_FOUND)
+
+    updated = await reset_admin_counter(admin_id, data.counter)
+    if not updated:
+        raise api_error(500, E.INVALID_INPUT, "Failed to reset counter")
+
+    await write_audit_log(
+        admin_id=admin.account_id,
+        admin_username=admin.username,
+        action="admin.counter_reset",
+        resource="admins",
+        resource_id=str(admin_id),
+        details=json.dumps({"counter": data.counter, "target_username": existing.get("username")}),
+        ip_address=get_client_ip(request),
+    )
+
+    return _account_to_response(updated)
 
 
 @router.get("/audit-log", response_model=AuditLogResponse)

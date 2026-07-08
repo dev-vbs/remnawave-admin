@@ -33,7 +33,7 @@ import {
   GripVertical,
   ArrowUpDown,
   RotateCcw,
-} from 'lucide-react'
+} from '@/components/brand/icons'
 import {
   DndContext,
   PointerSensor,
@@ -81,6 +81,10 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs'
 import { cn } from '@/lib/utils'
 import { ConfirmDialog } from '@/components/ConfirmDialog'
 import Billing from './Billing'
+import { ViewToggle } from '@/components/ViewToggle'
+import { useViewMode } from '@/lib/useViewMode'
+import { NodesTable } from '@/components/nodes/NodesTable'
+import { NodeCompactCard } from '@/components/nodes/NodeCompactCard'
 
 // Types
 interface Node {
@@ -94,6 +98,9 @@ interface Node {
   users_online: number
   xray_version: string | null
   message: string | null
+  note?: string | null
+  proxy_url?: string | null
+  node_consumption_multiplier?: number | null
   traffic_total_bytes: number
   traffic_today_bytes: number
   created_at: string
@@ -110,6 +117,9 @@ interface NodeEditFormData {
   name: string
   address: string
   port: string
+  note: string
+  proxy_url: string
+  node_consumption_multiplier: string
 }
 
 // API functions
@@ -135,18 +145,19 @@ function NodeEditModal({
   error: string
 }) {
   const { t } = useTranslation()
-  const [form, setForm] = useState<NodeEditFormData>({
+  const initForm = (): NodeEditFormData => ({
     name: node.name,
     address: node.address,
     port: String(node.port),
+    note: node.note || '',
+    proxy_url: node.proxy_url || '',
+    node_consumption_multiplier: node.node_consumption_multiplier != null ? String(node.node_consumption_multiplier) : '',
   })
+  const [form, setForm] = useState<NodeEditFormData>(initForm)
 
   useEffect(() => {
-    setForm({
-      name: node.name,
-      address: node.address,
-      port: String(node.port),
-    })
+    setForm(initForm())
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [node])
 
   const handleSubmit = () => {
@@ -155,6 +166,14 @@ function NodeEditModal({
     if (form.address !== node.address) updateData.address = form.address
     const newPort = parseInt(form.port, 10)
     if (!isNaN(newPort) && newPort !== node.port) updateData.port = newPort
+    if (form.note !== (node.note || '')) updateData.note = form.note || null
+    if (form.proxy_url !== (node.proxy_url || '')) updateData.proxy_url = form.proxy_url || null
+    const curMult = node.node_consumption_multiplier != null ? String(node.node_consumption_multiplier) : ''
+    if (form.node_consumption_multiplier !== curMult) {
+      const m = parseFloat(form.node_consumption_multiplier)
+      if (form.node_consumption_multiplier === '') updateData.node_consumption_multiplier = null
+      else if (!isNaN(m)) updateData.node_consumption_multiplier = m
+    }
     if (Object.keys(updateData).length === 0) {
       onOpenChange(false)
       return
@@ -208,6 +227,36 @@ function NodeEditModal({
               placeholder={t('nodes.editNode.port')}
             />
           </div>
+          <div className="space-y-2">
+            <Label>{t('nodes.editNode.note')}</Label>
+            <Input
+              type="text"
+              maxLength={255}
+              value={form.note}
+              onChange={(e) => setForm({ ...form, note: e.target.value })}
+              placeholder={t('nodes.editNode.notePlaceholder')}
+            />
+          </div>
+          <div className="space-y-2">
+            <Label>{t('nodes.editNode.proxyUrl')}</Label>
+            <Input
+              type="text"
+              value={form.proxy_url}
+              onChange={(e) => setForm({ ...form, proxy_url: e.target.value })}
+              placeholder="socks5://user:pass@host:port"
+            />
+          </div>
+          <div className="space-y-2">
+            <Label>{t('nodes.editNode.nodeConsumptionMultiplier')}</Label>
+            <Input
+              type="number"
+              step="0.1"
+              min={0}
+              value={form.node_consumption_multiplier}
+              onChange={(e) => setForm({ ...form, node_consumption_multiplier: e.target.value })}
+              placeholder="1.0"
+            />
+          </div>
         </div>
 
         <DialogFooter>
@@ -256,6 +305,9 @@ function NodeCreateModal({
     name: '',
     address: '',
     port: '62050',
+    note: '',
+    proxy_url: '',
+    node_consumption_multiplier: '',
   })
   const [selectedProfileUuid, setSelectedProfileUuid] = useState('')
   const [selectedInbounds, setSelectedInbounds] = useState<string[]>([])
@@ -280,7 +332,7 @@ function NodeCreateModal({
   // Reset form when modal closes
   useEffect(() => {
     if (!open) {
-      setForm({ name: '', address: '', port: '62050' })
+      setForm({ name: '', address: '', port: '62050', note: '', proxy_url: '', node_consumption_multiplier: '' })
       setSelectedProfileUuid('')
       setSelectedInbounds([])
     }
@@ -1316,6 +1368,7 @@ export default function Nodes() {
   const [confirmAction, setConfirmAction] = useState<{ type: string; uuid: string } | null>(null)
   const { schedule: scheduleAction } = useDeferredAction()
   const [sortState, setSortStateRaw] = useState<SortState>(() => loadSortState())
+  const [viewMode, setViewMode] = useViewMode('nodes')
 
   const setSortState = (next: SortState | ((prev: SortState) => SortState)) => {
     setSortStateRaw((prev) => {
@@ -1376,6 +1429,7 @@ export default function Nodes() {
     mutationFn: (uuid: string) => client.delete(`/nodes/${uuid}`),
     onSuccess: (_data, uuid) => {
       queryClient.invalidateQueries({ queryKey: ['nodes'] })
+      queryClient.invalidateQueries({ queryKey: ['admins'] })
       toast.success(t('nodes.toast.deleted'), { description: getNodeName(uuid) })
     },
     onError: (err: Error & { response?: { data?: { detail?: string } } }) => {
@@ -1402,6 +1456,7 @@ export default function Nodes() {
     mutationFn: (data: Record<string, unknown>) => client.post('/nodes', data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['nodes'] })
+      queryClient.invalidateQueries({ queryKey: ['admins'] })
       setShowCreateModal(false)
       setCreateError('')
       toast.success(t('nodes.toast.created'))
@@ -1537,90 +1592,132 @@ export default function Nodes() {
         </Card>
       </div>
 
-      {/* Sort controls */}
-      {!isLoading && sortedNodes.length > 0 && (
+      {/* Toolbar: sort + view toggle */}
+      {!isLoading && nodes.length > 0 && (
         <div className="flex items-center gap-2 flex-wrap">
-          <div className="flex items-center gap-1.5 text-xs text-dark-200">
-            <ArrowUpDown className="w-3.5 h-3.5" />
-            <span>{t('nodes.sort.label', { defaultValue: 'Сортировка' })}</span>
-          </div>
-          <Select
-            value={sortState.preset}
-            onValueChange={(v) =>
-              setSortState((prev) => {
-                const next = v as SortPreset
-                // When user picks "custom" without dragging yet — seed customOrder from current visible order
-                if (next === 'custom' && prev.customOrder.length === 0) {
-                  return { preset: 'custom', customOrder: sortedIds }
+          {viewMode !== 'table' && (
+            <>
+              <div className="flex items-center gap-1.5 text-xs text-dark-200">
+                <ArrowUpDown className="w-3.5 h-3.5" />
+                <span>{t('nodes.sort.label', { defaultValue: 'Сортировка' })}</span>
+              </div>
+              <Select
+                value={sortState.preset}
+                onValueChange={(v) =>
+                  setSortState((prev) => {
+                    const next = v as SortPreset
+                    // When user picks "custom" without dragging yet — seed customOrder from current visible order
+                    if (next === 'custom' && prev.customOrder.length === 0) {
+                      return { preset: 'custom', customOrder: sortedIds }
+                    }
+                    return { ...prev, preset: next }
+                  })
                 }
-                return { ...prev, preset: next }
-              })
-            }
-          >
-            <SelectTrigger className="h-8 w-[240px] text-xs">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {SORT_PRESETS.map((p) => (
-                <SelectItem key={p} value={p} className="text-xs">
-                  {t(`nodes.sort.preset.${p}`)}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-          {sortState.preset === 'custom' && (
-            <Button
-              variant="ghost"
-              size="sm"
-              className="h-8 px-2 text-xs text-dark-200 hover:text-white"
-              onClick={resetCustomOrder}
-              title={t('nodes.sort.resetCustom', { defaultValue: 'Сбросить порядок' })}
-            >
-              <RotateCcw className="w-3.5 h-3.5 mr-1.5" />
-              {t('nodes.sort.resetCustom', { defaultValue: 'Сбросить порядок' })}
-            </Button>
+              >
+                <SelectTrigger className="h-8 w-[240px] text-xs">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {SORT_PRESETS.map((p) => (
+                    <SelectItem key={p} value={p} className="text-xs">
+                      {t(`nodes.sort.preset.${p}`)}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              {sortState.preset === 'custom' && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-8 px-2 text-xs text-dark-200 hover:text-white"
+                  onClick={resetCustomOrder}
+                  title={t('nodes.sort.resetCustom', { defaultValue: 'Сбросить порядок' })}
+                >
+                  <RotateCcw className="w-3.5 h-3.5 mr-1.5" />
+                  {t('nodes.sort.resetCustom', { defaultValue: 'Сбросить порядок' })}
+                </Button>
+              )}
+            </>
           )}
+          <ViewToggle mode={viewMode} onChange={setViewMode} className="ml-auto" />
         </div>
       )}
 
-      {/* Nodes grid */}
-      <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
-        <SortableContext items={sortedIds} strategy={rectSortingStrategy}>
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-            {isLoading ? (
-              // Loading skeletons
-              Array.from({ length: 4 }).map((_, i) => <NodeSkeleton key={i} />)
-            ) : sortedNodes.length === 0 ? (
-              <div className="col-span-full">
-                <Card className="text-center py-12">
-                  <CardContent>
-                    <WifiOff className="w-12 h-12 text-dark-300 mx-auto mb-3" />
-                    <p className="text-dark-200">{t('nodes.status.noNodes')}</p>
-                  </CardContent>
-                </Card>
-              </div>
-            ) : (
-              sortedNodes.map((node, i) => (
-                <div key={node.uuid} className="animate-fade-in-up" style={{ animationDelay: `${0.05 + i * 0.04}s` }}>
-                  <SortableNodeCard
-                    node={node}
-                    enabled
-                    onRestart={() => restartNode.mutate(node.uuid)}
-                    onEdit={() => { setEditingNode(node); setEditError('') }}
-                    onEnable={() => enableNode.mutate(node.uuid)}
-                    onDisable={() => setConfirmAction({ type: 'disable', uuid: node.uuid })}
-                    onDelete={() => setConfirmAction({ type: 'delete', uuid: node.uuid })}
-                    onTokenManage={() => setTokenNode(node)}
-                    onFetchIps={() => setIpsNode(node)}
-                    canEdit={canEdit}
-                    canDelete={canDelete}
-                  />
+      {/* Nodes list */}
+      {!isLoading && viewMode === 'table' && nodes.length > 0 ? (
+        <NodesTable
+          nodes={sortedNodes}
+          canEdit={canEdit}
+          canDelete={canDelete}
+          onRestart={(n) => restartNode.mutate(n.uuid)}
+          onEdit={(n) => { setEditingNode(nodes.find((x) => x.uuid === n.uuid) ?? null); setEditError('') }}
+          onEnable={(n) => enableNode.mutate(n.uuid)}
+          onDisable={(n) => setConfirmAction({ type: 'disable', uuid: n.uuid })}
+          onDelete={(n) => setConfirmAction({ type: 'delete', uuid: n.uuid })}
+          onTokenManage={(n) => setTokenNode(nodes.find((x) => x.uuid === n.uuid) ?? null)}
+          onFetchIps={(n) => setIpsNode(nodes.find((x) => x.uuid === n.uuid) ?? null)}
+        />
+      ) : (
+        <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
+          <SortableContext items={sortedIds} strategy={rectSortingStrategy}>
+            <div
+              className={cn(
+                'grid gap-4',
+                viewMode === 'compact'
+                  ? 'grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4'
+                  : 'grid-cols-1 lg:grid-cols-2',
+              )}
+            >
+              {isLoading ? (
+                // Loading skeletons
+                Array.from({ length: 4 }).map((_, i) => <NodeSkeleton key={i} />)
+              ) : sortedNodes.length === 0 ? (
+                <div className="col-span-full">
+                  <Card className="text-center py-12">
+                    <CardContent>
+                      <WifiOff className="w-12 h-12 text-dark-300 mx-auto mb-3" />
+                      <p className="text-dark-200">{t('nodes.status.noNodes')}</p>
+                    </CardContent>
+                  </Card>
                 </div>
-              ))
-            )}
-          </div>
-        </SortableContext>
-      </DndContext>
+              ) : (
+                sortedNodes.map((node, i) => (
+                  <div key={node.uuid} className="animate-fade-in-up" style={{ animationDelay: `${0.05 + i * 0.04}s` }}>
+                    {viewMode === 'compact' ? (
+                      <NodeCompactCard
+                        node={node}
+                        canEdit={canEdit}
+                        canDelete={canDelete}
+                        onRestart={(n) => restartNode.mutate(n.uuid)}
+                        onEdit={(n) => { setEditingNode(nodes.find((x) => x.uuid === n.uuid) ?? null); setEditError('') }}
+                        onEnable={(n) => enableNode.mutate(n.uuid)}
+                        onDisable={(n) => setConfirmAction({ type: 'disable', uuid: n.uuid })}
+                        onDelete={(n) => setConfirmAction({ type: 'delete', uuid: n.uuid })}
+                        onTokenManage={(n) => setTokenNode(nodes.find((x) => x.uuid === n.uuid) ?? null)}
+                        onFetchIps={(n) => setIpsNode(nodes.find((x) => x.uuid === n.uuid) ?? null)}
+                      />
+                    ) : (
+                      <SortableNodeCard
+                        node={node}
+                        enabled
+                        onRestart={() => restartNode.mutate(node.uuid)}
+                        onEdit={() => { setEditingNode(node); setEditError('') }}
+                        onEnable={() => enableNode.mutate(node.uuid)}
+                        onDisable={() => setConfirmAction({ type: 'disable', uuid: node.uuid })}
+                        onDelete={() => setConfirmAction({ type: 'delete', uuid: node.uuid })}
+                        onTokenManage={() => setTokenNode(node)}
+                        onFetchIps={() => setIpsNode(node)}
+                        canEdit={canEdit}
+                        canDelete={canDelete}
+                      />
+                    )}
+                  </div>
+                ))
+              )}
+            </div>
+          </SortableContext>
+        </DndContext>
+      )}
 
       {/* Edit modal */}
       {editingNode && (

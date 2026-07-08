@@ -14,7 +14,7 @@ import {
   Bell, Settings2, Shield, Mail, MessageSquare, Webhook,
   Check, Trash2, Plus, Power, PowerOff, Pencil, Send, AlertTriangle,
   CheckCircle2, ChevronDown, ChevronRight, MonitorSmartphone,
-} from 'lucide-react'
+} from '@/components/brand/icons'
 
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -206,6 +206,7 @@ function NotificationsTab() {
   const [page, setPage] = useState(1)
   const [filterRead, setFilterRead] = useState<string>('all')
   const [filterSeverity, setFilterSeverity] = useState<string>('all')
+  const [confirmDeleteOld, setConfirmDeleteOld] = useState(false)
 
   const params: Record<string, unknown> = { page, per_page: 20 }
   if (filterRead === 'unread') params.is_read = false
@@ -273,9 +274,9 @@ function NotificationsTab() {
                 <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
                 <SelectContent>
                   <SelectItem value="all">{t('common.all')}</SelectItem>
-                  <SelectItem value="info">Info</SelectItem>
-                  <SelectItem value="warning">Warning</SelectItem>
-                  <SelectItem value="critical">Critical</SelectItem>
+                  <SelectItem value="info">{t('notifications.filters.severityInfo')}</SelectItem>
+                  <SelectItem value="warning">{t('notifications.filters.severityWarning')}</SelectItem>
+                  <SelectItem value="critical">{t('notifications.filters.severityCritical')}</SelectItem>
                 </SelectContent>
               </Select>
             </div>
@@ -284,7 +285,7 @@ function NotificationsTab() {
                 <Check className="w-4 h-4 mr-1" />
                 <span className="truncate">{t('notifications.markAllRead')}</span>
               </Button>
-              <Button variant="outline" size="sm" onClick={() => deleteOld.mutate()} className="text-red-400 flex-1 sm:flex-none">
+              <Button variant="outline" size="sm" onClick={() => setConfirmDeleteOld(true)} className="text-red-400 flex-1 sm:flex-none">
                 <Trash2 className="w-4 h-4 mr-1" />
                 <span className="truncate">{t('notifications.deleteOld')}</span>
               </Button>
@@ -334,6 +335,7 @@ function NotificationsTab() {
                   <button
                     onClick={() => deleteOne.mutate(n.id)}
                     className="text-dark-400 hover:text-red-400 transition-colors p-1"
+                    aria-label={t('common.delete')}
                   >
                     <Trash2 className="w-3.5 h-3.5" />
                   </button>
@@ -358,6 +360,16 @@ function NotificationsTab() {
           </Button>
         </div>
       )}
+
+      <ConfirmDialog
+        open={confirmDeleteOld}
+        onOpenChange={setConfirmDeleteOld}
+        title={t('notifications.deleteOldConfirmTitle', { defaultValue: 'Удалить старые уведомления?' })}
+        description={t('notifications.deleteOldConfirmDesc', { defaultValue: 'Все прочитанные уведомления старше 30 дней будут удалены. Действие необратимо.' })}
+        confirmLabel={t('common.delete')}
+        variant="destructive"
+        onConfirm={() => deleteOld.mutate()}
+      />
     </div>
   )
 }
@@ -751,7 +763,7 @@ function AlertRuleDialog({ rule, open, onClose }: { rule: AlertRule | null; open
                   <SelectItem value="service">{t('notifications.alerts.topicService', 'Service')}</SelectItem>
                   <SelectItem value="violations">{t('notifications.alerts.topicViolations', 'Violations')}</SelectItem>
                   <SelectItem value="errors">{t('notifications.alerts.topicErrors', 'Errors')}</SelectItem>
-                  <SelectItem value="hwid">HWID</SelectItem>
+                  <SelectItem value="hwid">{t('notifications.alerts.topicHwid')}</SelectItem>
                 </SelectContent>
               </Select>
             </div>
@@ -1017,6 +1029,7 @@ function ChannelsTab() {
   const { t } = useTranslation()
   const queryClient = useQueryClient()
   const [addDialogOpen, setAddDialogOpen] = useState(false)
+  const [deleteChannelId, setDeleteChannelId] = useState<number | null>(null)
   const isSuperadmin = usePermissionStore((s) => s.role) === 'superadmin'
 
   const { data: channels = [], isLoading, isError, refetch } = useQuery({
@@ -1103,7 +1116,7 @@ function ChannelsTab() {
                       checked={ch.is_enabled}
                       onCheckedChange={(v) => toggleChannel.mutate({ id: ch.id, enabled: v })}
                     />
-                    <Button variant="ghost" size="icon" className="text-red-400" onClick={() => deleteChannel.mutate(ch.id)} aria-label={t('common.delete')}>
+                    <Button variant="ghost" size="icon" className="text-red-400" onClick={() => setDeleteChannelId(ch.id)} aria-label={t('common.delete')}>
                       <Trash2 className="w-4 h-4" />
                     </Button>
                   </CardContent>
@@ -1121,6 +1134,16 @@ function ChannelsTab() {
       {addDialogOpen && (
         <AddChannelDialog open={addDialogOpen} onClose={() => setAddDialogOpen(false)} />
       )}
+
+      <ConfirmDialog
+        open={deleteChannelId !== null}
+        onOpenChange={(open) => { if (!open) setDeleteChannelId(null) }}
+        title={t('notifications.channels.deleteConfirmTitle', { defaultValue: 'Удалить канал?' })}
+        description={t('notifications.channels.deleteConfirmDesc', { defaultValue: 'Канал уведомлений будет удалён. Алерты перестанут отправляться в него.' })}
+        confirmLabel={t('common.delete')}
+        variant="destructive"
+        onConfirm={() => { if (deleteChannelId !== null) deleteChannel.mutate(deleteChannelId) }}
+      />
     </div>
   )
 }
@@ -1156,9 +1179,9 @@ function AddChannelDialog({ open, onClose }: { open: boolean; onClose: () => voi
             <Select value={type} onValueChange={(v) => { setType(v); setConfig({}) }}>
               <SelectTrigger><SelectValue /></SelectTrigger>
               <SelectContent>
-                <SelectItem value="telegram">Telegram</SelectItem>
-                <SelectItem value="webhook">Webhook</SelectItem>
-                <SelectItem value="email">Email</SelectItem>
+                <SelectItem value="telegram">{t('notifications.channels.telegram')}</SelectItem>
+                <SelectItem value="webhook">{t('notifications.channels.webhook')}</SelectItem>
+                <SelectItem value="email">{t('notifications.channels.email')}</SelectItem>
               </SelectContent>
             </Select>
           </div>
@@ -1166,7 +1189,7 @@ function AddChannelDialog({ open, onClose }: { open: boolean; onClose: () => voi
           {type === 'telegram' && (
             <>
               <div>
-                <Label>Chat ID</Label>
+                <Label>{t('notifications.channels.chatId')}</Label>
                 <Input
                   value={config.chat_id || ''}
                   onChange={(e) => setConfig({ ...config, chat_id: e.target.value })}
@@ -1186,7 +1209,7 @@ function AddChannelDialog({ open, onClose }: { open: boolean; onClose: () => voi
 
           {type === 'webhook' && (
             <div>
-              <Label>Webhook URL</Label>
+              <Label>{t('notifications.channels.webhookUrl')}</Label>
               <Input
                 value={config.url || ''}
                 onChange={(e) => setConfig({ ...config, url: e.target.value })}
@@ -1198,7 +1221,7 @@ function AddChannelDialog({ open, onClose }: { open: boolean; onClose: () => voi
 
           {type === 'email' && (
             <div>
-              <Label>Email</Label>
+              <Label>{t('notifications.channels.emailLabel')}</Label>
               <Input
                 type="email"
                 value={config.email || ''}
@@ -1360,14 +1383,14 @@ function SmtpConfigSection() {
                 checked={form.use_tls ?? true}
                 onCheckedChange={(v) => setForm({ ...form, use_tls: v, use_ssl: v ? false : form.use_ssl })}
               />
-              <Label>TLS (STARTTLS)</Label>
+              <Label>{t('notifications.channels.tlsStarttls')}</Label>
             </div>
             <div className="flex items-center gap-2">
               <Switch
                 checked={form.use_ssl ?? false}
                 onCheckedChange={(v) => setForm({ ...form, use_ssl: v, use_tls: v ? false : form.use_tls })}
               />
-              <Label>SSL</Label>
+              <Label>{t('notifications.channels.ssl')}</Label>
             </div>
             <div className="flex items-center gap-2">
               <Switch
@@ -1388,6 +1411,7 @@ function SmtpConfigSection() {
                 value={testEmail}
                 onChange={(e) => setTestEmail(e.target.value)}
                 className="min-w-0"
+                aria-label="Email"
               />
               <Button variant="outline" onClick={() => testSmtp.mutate()} disabled={!testEmail || testSmtp.isPending} className="flex-shrink-0">
                 <Send className="w-4 h-4 mr-1" />

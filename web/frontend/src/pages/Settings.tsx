@@ -11,13 +11,14 @@ import {
   ChevronRight,
   Search,
   RefreshCw,
+  RotateCcw,
   Database,
   X,
   Eye,
   EyeOff,
   Copy,
   KeyRound,
-} from 'lucide-react'
+} from '@/components/brand/icons'
 import { toast } from 'sonner'
 import client from '../api/client'
 import { authApi } from '../api/auth'
@@ -226,7 +227,7 @@ function SyncStatusBlock({
               disabled={syncingEntity !== null || !canEdit}
               className="flex items-center gap-1.5 text-xs font-medium text-primary-400 bg-primary-500/10 hover:bg-primary-500/20 border-primary-500/20"
             >
-              <RefreshCw className={cn('w-3.5 h-3.5', syncingEntity === 'all' && 'animate-spin')} />
+              <RotateCcw className={cn('w-3.5 h-3.5', syncingEntity === 'all' && 'animate-spin')} />
               {t('settings.sync.syncAll')}
             </Button>
           </div>
@@ -252,10 +253,13 @@ function SyncStatusBlock({
                           aria-label={t('common.refresh')}
                           title={t('settings.sync.syncEntity')}
                         >
-                          <RefreshCw className={cn('w-3.5 h-3.5', isSyncing && 'animate-spin')} />
+                          <RotateCcw className={cn('w-3.5 h-3.5', isSyncing && 'animate-spin')} />
                         </Button>
                       )}
-                      <span className={cn(
+                      <span
+                        title={item.sync_status}
+                        aria-label={item.sync_status}
+                        className={cn(
                         'w-2 h-2 rounded-full',
                         item.sync_status === 'success' ? 'bg-green-500' :
                         item.sync_status === 'error' ? 'bg-red-500' :
@@ -451,6 +455,7 @@ function SettingsPasswordInput({
   autoComplete?: string
   disabled?: boolean
 }) {
+  const { t } = useTranslation()
   const [show, setShow] = useState(false)
 
   return (
@@ -469,7 +474,7 @@ function SettingsPasswordInput({
         type="button"
         onClick={() => setShow(!show)}
         className="absolute right-3 top-1/2 -translate-y-1/2 text-dark-400 hover:text-dark-200 transition-colors"
-        tabIndex={-1}
+        aria-label={show ? t('common.hide') : t('common.show')}
       >
         {show ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
       </button>
@@ -739,7 +744,7 @@ function IpWhitelistBlock() {
           ) : (
             <ChevronRight className="w-5 h-5 text-dark-200" />
           )}
-          <h2 className="text-base font-semibold text-white">IP Whitelist</h2>
+          <h2 className="text-base font-semibold text-white">{t('settings.ipWhitelist.title')}</h2>
           {enabled ? (
             <Badge variant="success" className="text-[10px] px-1.5 py-0.5">
               {ips.length} IP
@@ -807,6 +812,7 @@ function IpWhitelistBlock() {
               placeholder="1.2.3.4 or 10.0.0.0/24"
               className="flex-1 font-mono text-sm"
               disabled={saving}
+              aria-label={t('settings.ipWhitelist.title')}
             />
             <Button
               onClick={addIp}

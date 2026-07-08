@@ -16,7 +16,7 @@ import {
   ChevronDown,
   ChevronRight,
   Settings2,
-} from 'lucide-react'
+} from '@/components/brand/icons'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -243,7 +243,7 @@ export default function SystemLogs() {
 
   // WebSocket streaming
   useEffect(() => {
-    if (!isStreaming || !accessToken) return
+    if (!isStreaming) return
 
     const envUrl =
       window.__ENV?.API_URL ||
@@ -263,8 +263,12 @@ export default function SystemLogs() {
       base = `${proto}//${host}/api/v2`
     }
 
-    const wsUrl = `${base}/logs/stream?token=${encodeURIComponent(accessToken)}&file=${activeTab}`
-    const ws = new WebSocket(wsUrl)
+    const wsUrl = `${base}/logs/stream?file=${activeTab}`
+    // JWT через subprotocol (если есть в памяти) — не попадает в access-логи;
+    // иначе аутентификация по HttpOnly cookie
+    const ws = accessToken
+      ? new WebSocket(wsUrl, ['access-token', accessToken])
+      : new WebSocket(wsUrl)
     wsRef.current = ws
 
     ws.onopen = () => {
@@ -397,12 +401,12 @@ export default function SystemLogs() {
                 {isStreaming ? (
                   <>
                     <Pause className="w-4 h-4 sm:mr-1" />
-                    <span className="hidden sm:inline">Live</span>
+                    <span className="hidden sm:inline">{t('systemLogs.live')}</span>
                   </>
                 ) : (
                   <>
                     <Play className="w-4 h-4 sm:mr-1" />
-                    <span className="hidden sm:inline">Paused</span>
+                    <span className="hidden sm:inline">{t('systemLogs.paused')}</span>
                   </>
                 )}
               </Button>
@@ -491,10 +495,10 @@ export default function SystemLogs() {
                       </SelectTrigger>
                       <SelectContent>
                         <SelectItem value="all">{t('logs.allLevels')}</SelectItem>
-                        <SelectItem value="DEBUG">DEBUG</SelectItem>
-                        <SelectItem value="INFO">INFO</SelectItem>
-                        <SelectItem value="WARNING">WARNING</SelectItem>
-                        <SelectItem value="ERROR">ERROR</SelectItem>
+                        <SelectItem value="DEBUG">{t('systemLogs.logLevels.debug')}</SelectItem>
+                        <SelectItem value="INFO">{t('systemLogs.logLevels.info')}</SelectItem>
+                        <SelectItem value="WARNING">{t('systemLogs.logLevels.warning')}</SelectItem>
+                        <SelectItem value="ERROR">{t('systemLogs.logLevels.error')}</SelectItem>
                       </SelectContent>
                     </Select>
                   </div>

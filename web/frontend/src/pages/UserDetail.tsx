@@ -3,8 +3,10 @@ import { useParams, useNavigate, useSearchParams, Link } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
 import { useFormatters, formatDateShortUtil } from '@/lib/useFormatters'
+import { translateBackendError } from '@/lib/mutationToast'
 import {
   ArrowLeft,
+  ArrowLeftRight,
   RefreshCw,
   ChevronLeft,
   ChevronRight,
@@ -34,10 +36,12 @@ import {
   Settings,
   KeyRound,
   Bot,
-} from 'lucide-react'
+  MessageSquare,
+} from '@/components/brand/icons'
 import { toast } from 'sonner'
 import client from '../api/client'
 import { useHasPermission } from '../components/PermissionGate'
+import { usePermissionStore } from '@/store/permissionStore'
 
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -48,7 +52,15 @@ import { Separator } from '@/components/ui/separator'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Label } from '@/components/ui/label'
 import { Checkbox } from '@/components/ui/checkbox'
-import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '@/components/ui/dialog'
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from '@/components/ui/dialog'
+import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+} from '@/components/ui/dropdown-menu'
 import { ConfirmDialog } from '@/components/ConfirmDialog'
 import { cn } from '@/lib/utils'
 import { QRCodeSVG } from 'qrcode.react'
@@ -85,6 +97,7 @@ interface UserDetailData {
   ss_password: string | null
   first_connected_at: string | null
   last_connected_node_uuid: string | null
+  created_by_admin_username: string | null
   // Anti-abuse
   trust_score: number | null
   violation_count_30d: number
@@ -169,7 +182,7 @@ function getPlatformIcon(platform: string | null, t: (key: string) => string): {
 }
 
 function bytesToGb(bytes: number | null): string {
-  if (!bytes) return ''
+  if (bytes === null || bytes === undefined) return ''
   return (bytes / (1024 * 1024 * 1024)).toFixed(2)
 }
 
@@ -569,6 +582,7 @@ function PaginatedDeviceList({
                       size="sm"
                       onClick={() => onDeleteDevice(device.hwid!)}
                       className="h-6 w-6 p-0 text-red-400 hover:text-red-300 hover:bg-red-500/10"
+                      aria-label={t('common.delete')}
                     >
                       <Trash2 className="h-3.5 w-3.5" />
                     </Button>
@@ -672,6 +686,7 @@ function PaginatedDeviceList({
             onClick={() => setDevicePage(Math.max(1, devicePage - 1))}
             disabled={devicePage <= 1}
             className="h-7 w-7 p-0"
+            aria-label={t('common.previousPage')}
           >
             <ChevronLeft className="h-4 w-4" />
           </Button>
@@ -684,6 +699,7 @@ function PaginatedDeviceList({
             onClick={() => setDevicePage(Math.min(totalDevicePages, devicePage + 1))}
             disabled={devicePage >= totalDevicePages}
             className="h-7 w-7 p-0"
+            aria-label={t('common.nextPage')}
           >
             <ChevronRight className="h-4 w-4" />
           </Button>
@@ -742,8 +758,9 @@ function UserHistory({ uuid }: { uuid: string }) {
             <div className="relative pl-6 space-y-4">
               <div className="absolute left-[9px] top-2 bottom-2 w-px bg-[var(--glass-bg-hover)]" />
               {items.map((item) => {
-                const dot = item.action?.indexOf('.') ?? -1
-                const action = dot > 0 ? item.action.slice(dot + 1) : item.action
+                const rawAction = item.action ?? ''
+                const dot = rawAction.indexOf('.')
+                const action = dot > 0 ? rawAction.slice(dot + 1) : rawAction || 'unknown'
                 return (
                   <div key={item.id} className="relative">
                     <div className="absolute -left-6 top-1 w-[7px] h-[7px] rounded-full bg-primary-400 ring-2 ring-dark-800" />
@@ -994,7 +1011,7 @@ function SubscriptionInfoDialog({
                     <div
                       key={i}
                       className="flex items-center gap-2 bg-[var(--glass-bg)] rounded px-2 py-1 cursor-pointer hover:bg-[var(--glass-border)]"
-                      onClick={() => { navigator.clipboard.writeText(link); toast.success('Copied') }}
+                      onClick={() => { navigator.clipboard.writeText(link); toast.success(t('common.copied')) }}
                     >
                       <span className="text-[10px] font-mono text-white/70 truncate flex-1">{link}</span>
                       <Copy className="w-3 h-3 text-muted-foreground shrink-0" />
@@ -1173,7 +1190,7 @@ function IpControlDialog({
                           key={ipStr}
                           variant="secondary"
                           className="text-xs font-mono cursor-pointer hover:bg-primary-600/20"
-                          onClick={() => { navigator.clipboard.writeText(ipStr); toast.success('Copied') }}
+                          onClick={() => { navigator.clipboard.writeText(ipStr); toast.success(t('common.copied')) }}
                         >
                           {ipStr}
                         </Badge>
@@ -1189,6 +1206,71 @@ function IpControlDialog({
         ) : null}
       </DialogContent>
     </Dialog>
+  )
+}
+
+function RemainingTrafficIndicator() {
+  const { t } = useTranslation()
+  const maxGb = usePermissionStore((s) => s.maxTrafficGb)
+  const usedBytes = usePermissionStore((s) => s.trafficUsedBytes)
+  const policy = usePermissionStore((s) => s.unlimitedTrafficPolicy)
+  if (policy !== 'disabled' || maxGb == null) return null
+  const usedGb = Math.round(usedBytes / 1073741824 * 10) / 10
+  const remaining = Math.max(0, maxGb - usedGb)
+  return (
+    <p className="text-xs text-dark-300 mb-1">
+      {t('admins.remainingTraffic', { remaining: remaining.toFixed(1), total: maxGb })}
+    </p>
+  )
+}
+
+interface DeeplinkItem {
+  id: string
+  label: string
+  link: string
+}
+
+function ImportClientDropdown({ userUuid }: { userUuid: string }) {
+  const { t } = useTranslation()
+  const [open, setOpen] = useState(false)
+  const { data, isLoading } = useQuery<{ links: DeeplinkItem[] }>({
+    queryKey: ['user-deeplinks', userUuid],
+    queryFn: async () => {
+      const { data } = await client.get(`/users/${userUuid}/deeplinks`)
+      return data
+    },
+    enabled: open,
+    staleTime: 5 * 60 * 1000,
+  })
+
+  const copyLink = (item: DeeplinkItem) => {
+    navigator.clipboard.writeText(item.link)
+    toast.success(t('userDetail.subscription.importCopied', { client: item.label }))
+  }
+
+  return (
+    <DropdownMenu open={open} onOpenChange={setOpen}>
+      <DropdownMenuTrigger asChild>
+        <Button variant="outline" size="sm" className="h-7 px-2.5 text-xs gap-1">
+          <Smartphone className="h-3.5 w-3.5" />
+          {t('userDetail.subscription.importToClient')}
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="start" className="w-52">
+        <DropdownMenuLabel>{t('userDetail.subscription.importPickClient')}</DropdownMenuLabel>
+        <DropdownMenuSeparator />
+        {isLoading ? (
+          <DropdownMenuItem disabled>{t('common.loading')}</DropdownMenuItem>
+        ) : (
+          (data?.links ?? []).map((item) => (
+            <DropdownMenuItem key={item.id} onClick={() => copyLink(item)}>
+              <Copy className="h-3.5 w-3.5 mr-2 text-dark-300" />
+              {item.label}
+            </DropdownMenuItem>
+          ))
+        )}
+      </DropdownMenuContent>
+    </DropdownMenu>
   )
 }
 
@@ -1223,6 +1305,8 @@ export default function UserDetail() {
   const qrRef = useRef<HTMLDivElement>(null)
   const canEdit = useHasPermission('users', 'edit')
   const canDelete = useHasPermission('users', 'delete')
+  const role = usePermissionStore((s) => s.role)
+  const isSuperadmin = role === 'superadmin'
   const [isEditing, setIsEditing] = useState(searchParams.get('edit') === '1' && canEdit)
   const [editForm, setEditForm] = useState<EditFormData>({
     status: '',
@@ -1247,6 +1331,7 @@ export default function UserDetail() {
     return () => { timersRef.current.forEach(clearTimeout) }
   }, [])
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
+  const [resetTrafficConfirm, setResetTrafficConfirm] = useState(false)
   const [showRevokeFullConfirm, setShowRevokeFullConfirm] = useState(false)
   const [showRevokePasswordsConfirm, setShowRevokePasswordsConfirm] = useState(false)
   const [exclusionDialogOpen, setExclusionDialogOpen] = useState(false)
@@ -1267,6 +1352,18 @@ export default function UserDetail() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['violationWhitelist'] })
       toast.success(t('violations.toast.whitelistAdded'))
+      setExclusionDialogOpen(false)
+    },
+    onError: (err: Error & { response?: { data?: { detail?: string } } }) => {
+      toast.error(err.response?.data?.detail || err.message || t('common.error'))
+    },
+  })
+
+  const removeWhitelistMutation = useMutation({
+    mutationFn: (userUuid: string) => client.delete(`/violations/whitelist/${userUuid}`),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['violationWhitelist'] })
+      toast.success(t('violations.toast.whitelistRemoved'))
       setExclusionDialogOpen(false)
     },
     onError: (err: Error & { response?: { data?: { detail?: string } } }) => {
@@ -1312,6 +1409,11 @@ export default function UserDetail() {
     },
     staleTime: 120_000,
   })
+
+  const unlimitedPolicy = usePermissionStore(s => s.unlimitedTrafficPolicy)
+
+  const isUnlimitedLocked = unlimitedPolicy !== undefined && unlimitedPolicy !== 'allowed'
+  const effectiveIsUnlimited = unlimitedPolicy === 'enforced' ? true : unlimitedPolicy === 'disabled' ? false : editForm.is_unlimited
 
   // Fetch HWID devices
   const { data: hwidDevices, isFetching: hwidFetching } = useQuery<HwidDevice[]>({
@@ -1403,7 +1505,13 @@ export default function UserDetail() {
   })
   const resetTrafficMutation = useMutation({
     mutationFn: async () => { await client.post(`/users/${uuid}/reset-traffic`) },
-    onSuccess: () => { queryClient.invalidateQueries({ queryKey: ['user', uuid] }); toast.success(t('userDetail.toasts.trafficReset')) },
+    onSuccess: async () => {
+      queryClient.invalidateQueries({ queryKey: ['user', uuid] })
+      queryClient.invalidateQueries({ queryKey: ['admins'] })
+      // Counter change is attributed to the owner; refresh to reflect new state.
+      await usePermissionStore.getState().refreshAdmin()
+      toast.success(t('userDetail.toasts.trafficReset'))
+    },
     onError: (err: Error & { response?: { data?: { detail?: string } } }) => { toast.error(err.response?.data?.detail || err.message || t('userDetail.toasts.error')) },
   })
   const revokeFullMutation = useMutation({
@@ -1418,8 +1526,54 @@ export default function UserDetail() {
   })
   const deleteMutation = useMutation({
     mutationFn: async () => { await client.delete(`/users/${uuid}`) },
-    onSuccess: () => { toast.success(t('userDetail.toasts.userDeleted')); navigate('/users') },
+    onSuccess: async () => {
+      queryClient.invalidateQueries({ queryKey: ['admins'] })
+      // Refresh the current admin's quota counters (counter changes go to the owner)
+      await usePermissionStore.getState().refreshAdmin()
+      toast.success(t('userDetail.toasts.userDeleted')); navigate('/users')
+    },
     onError: (err: Error & { response?: { data?: { detail?: string } } }) => { toast.error(err.response?.data?.detail || err.message || t('userDetail.toasts.deleteError')) },
+  })
+
+  // Reassign user to another admin
+  const [showReassignDialog, setShowReassignDialog] = useState(false)
+  const [reassignAdminId, setReassignAdminId] = useState('')
+  const { data: allAdminsData } = useQuery({
+    queryKey: ['admins'],
+    queryFn: () => client.get('/admins').then(r => r.data),
+    staleTime: 60000,
+    enabled: isSuperadmin,
+  })
+  const allAdmins: { id: number; username: string }[] = allAdminsData?.items ?? []
+  const reassignMutation = useMutation({
+    mutationFn: async (newAdminId: number) => {
+      await client.post(`/users/${uuid}/reassign`, { new_admin_id: newAdminId })
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['user', uuid] })
+      queryClient.invalidateQueries({ queryKey: ['users'] })
+      queryClient.invalidateQueries({ queryKey: ['admins'] })
+      toast.success(t('userDetail.toasts.reassigned'))
+      setShowReassignDialog(false)
+    },
+    onError: (err: Error & { response?: { data?: { detail?: string } } }) => {
+      toast.error(err.response?.data?.detail || err.message || t('userDetail.toasts.error'))
+    },
+  })
+
+  const unassignAdminMutation = useMutation({
+    mutationFn: async () => {
+      await client.post(`/users/${uuid}/unassign-admin`)
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['user', uuid] })
+      queryClient.invalidateQueries({ queryKey: ['users'] })
+      queryClient.invalidateQueries({ queryKey: ['admins'] })
+      toast.success(t('userDetail.toasts.adminUnassigned'))
+    },
+    onError: (err: Error & { response?: { data?: { detail?: string } } }) => {
+      toast.error(err.response?.data?.detail || err.message || t('userDetail.toasts.error'))
+    },
   })
 
   const updateUserMutation = useMutation({
@@ -1427,9 +1581,12 @@ export default function UserDetail() {
       const response = await client.patch(`/users/${uuid}`, data)
       return response.data
     },
-    onSuccess: () => {
+    onSuccess: async () => {
       queryClient.invalidateQueries({ queryKey: ['user', uuid] })
       queryClient.invalidateQueries({ queryKey: ['users'] })
+      queryClient.invalidateQueries({ queryKey: ['admins'] })
+      // Refresh the current admin's quota counters (counter changes go to the owner)
+      await usePermissionStore.getState().refreshAdmin()
       toast.success(t('userDetail.toasts.userUpdated'))
       setEditSuccess(true)
       setEditError('')
@@ -1438,7 +1595,8 @@ export default function UserDetail() {
       setSearchParams({})
     },
     onError: (err: Error & { response?: { data?: { detail?: string } } }) => {
-      setEditError(err.response?.data?.detail || err.message || t('userDetail.toasts.saveError'))
+      const detail = err.response?.data?.detail
+      setEditError(detail ? translateBackendError(detail) : (err.message || t('userDetail.toasts.saveError')))
     },
   })
 
@@ -1452,7 +1610,7 @@ export default function UserDetail() {
     }
 
     // Traffic limit
-    const newTrafficLimit = editForm.is_unlimited ? null : gbToBytes(editForm.traffic_limit_gb)
+    const newTrafficLimit = effectiveIsUnlimited ? null : gbToBytes(editForm.traffic_limit_gb)
     if (user && newTrafficLimit !== user.traffic_limit_bytes) {
       updateData.traffic_limit_bytes = newTrafficLimit
     }
@@ -1734,7 +1892,7 @@ export default function UserDetail() {
                     <Button
                       variant="outline"
                       size="sm"
-                      onClick={() => resetTrafficMutation.mutate()}
+                      onClick={() => setResetTrafficConfirm(true)}
                       disabled={resetTrafficMutation.isPending}
                       className="text-primary-400"
                     >
@@ -1752,6 +1910,17 @@ export default function UserDetail() {
                     >
                       <Trash2 className="h-4 w-4 mr-1.5" />
                       {t('userDetail.actions.delete')}
+                    </Button>
+                  )}
+                  {isSuperadmin && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => { setReassignAdminId(''); setShowReassignDialog(true) }}
+                      className="text-primary-400"
+                    >
+                      <ArrowLeftRight className="h-4 w-4 mr-1.5" />
+                      {t('userDetail.actions.reassign')}
                     </Button>
                   )}
                 </>
@@ -1875,31 +2044,38 @@ export default function UserDetail() {
                       <label className="flex items-center gap-2 cursor-pointer">
                         <input
                           type="checkbox"
-                          checked={editForm.is_unlimited}
-                          onChange={(e) => setEditForm({
-                            ...editForm,
-                            is_unlimited: e.target.checked,
-                            traffic_limit_gb: e.target.checked ? '' : editForm.traffic_limit_gb,
-                          })}
-                          className="w-4 h-4 rounded border-[var(--glass-border)] bg-[var(--glass-bg)] text-primary-500 focus:ring-primary-500/50"
+                          checked={effectiveIsUnlimited}
+                          disabled={isUnlimitedLocked}
+                          onChange={(e) => {
+                            if (isUnlimitedLocked) return
+                            setEditForm({
+                              ...editForm,
+                              is_unlimited: e.target.checked,
+                              traffic_limit_gb: e.target.checked ? '' : editForm.traffic_limit_gb,
+                            })
+                          }}
+                          className="w-4 h-4 rounded border-[var(--glass-border)] bg-[var(--glass-bg)] text-primary-500 focus:ring-primary-500/50 disabled:opacity-50 disabled:cursor-not-allowed"
                         />
                         <span className="text-sm text-dark-100">{t('userDetail.trafficUnlimited')}</span>
                       </label>
                     </div>
-                    {!editForm.is_unlimited && (
-                      <div className="relative">
-                        <Input
-                          type="number"
-                          step="0.1"
-                          min="0"
-                          value={editForm.traffic_limit_gb}
-                          onChange={(e) => setEditForm({ ...editForm, traffic_limit_gb: e.target.value })}
-                          placeholder={t('userDetail.fields.enterLimit')}
-                          className="pr-12"
-                        />
-                        <span className="absolute right-3 top-1/2 -translate-y-1/2 text-sm text-dark-200">{t('userDetail.fields.gb')}</span>
-                      </div>
-                    )}
+          {!effectiveIsUnlimited && (
+              <div className="relative">
+                  <Input
+                    type="number"
+                    step="0.1"
+                    min="0"
+                    value={editForm.traffic_limit_gb}
+                    onChange={(e) =>
+                      setEditForm({ ...editForm, traffic_limit_gb: e.target.value, })
+                    }
+                    placeholder="0.0"
+                    className="pr-12"
+                  />
+                  <span className="absolute right-3 top-1/2 -translate-y-1/2 text-sm text-dark-200">{t('userDetail.gb')}</span>
+                </div>
+              )}
+                    <RemainingTrafficIndicator />
                   </div>
 
                   {/* Traffic reset strategy */}
@@ -1949,7 +2125,7 @@ export default function UserDetail() {
                             setEditForm({ ...editForm, expire_at: local })
                           }}
                         >
-                          {label === '2099' ? '♾️ 2099' : `+${label}`}
+                          {label === '2099' ? t('userDetail.indefinite') : `+${label}`}
                         </Button>
                       ))}
                     </div>
@@ -2046,11 +2222,11 @@ export default function UserDetail() {
                     <p className="text-xs text-dark-300 mb-3">{t('userDetail.fields.readOnly')}</p>
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                       <div>
-                        <p className="text-xs text-dark-200">Username</p>
+                        <p className="text-xs text-dark-200">{t('userDetail.fields.username')}</p>
                         <p className="text-white text-sm">{user.username || '\u2014'}</p>
                       </div>
                       <div>
-                        <p className="text-xs text-dark-200">Short UUID</p>
+                        <p className="text-xs text-dark-200">{t('userDetail.fields.shortUuid')}</p>
                         <p className="text-white text-sm font-mono">{user.short_uuid || '\u2014'}</p>
                       </div>
                     </div>
@@ -2061,7 +2237,7 @@ export default function UserDetail() {
                 <div className="space-y-4">
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                     <div>
-                      <p className="text-sm text-dark-200">Username</p>
+                      <p className="text-sm text-dark-200">{t('userDetail.fields.username')}</p>
                       <p className="text-white">{user.username || '\u2014'}</p>
                     </div>
                     <div>
@@ -2087,7 +2263,7 @@ export default function UserDetail() {
                       </div>
                     </div>
                     <div>
-                      <p className="text-sm text-dark-200">Short UUID</p>
+                      <p className="text-sm text-dark-200">{t('userDetail.fields.shortUuid')}</p>
                       <p className="text-white font-mono">{user.short_uuid || '\u2014'}</p>
                     </div>
                     {user.tag && (
@@ -2119,6 +2295,25 @@ export default function UserDetail() {
                           : '\u2014'}
                       </p>
                     </div>
+                    {user.created_by_admin_username && (
+                      <div>
+                        <div className="flex items-center gap-1.5 mb-0.5">
+                          <Users className="h-3.5 w-3.5 text-dark-300" />
+                          <p className="text-sm text-dark-200">{t('userDetail.fields.createdBy')}</p>
+                        </div>
+                        <p className="text-white flex items-center gap-2">
+                          {user.created_by_admin_username}
+                          {isSuperadmin && (
+                            <button
+                              onClick={() => unassignAdminMutation.mutate()}
+                              className="text-[10px] text-dark-400 hover:text-red-400 transition-colors underline underline-offset-2"
+                            >
+                              {t('userDetail.actions.clearCreatedBy')}
+                            </button>
+                          )}
+                        </p>
+                      </div>
+                    )}
                     <div>
                       <div className="flex items-center gap-1.5 mb-0.5">
                         <Clock className="h-3.5 w-3.5 text-dark-300" />
@@ -2195,23 +2390,23 @@ export default function UserDetail() {
                     <>
                       <Separator />
                       <div>
-                        <p className="text-sm text-dark-200 mb-2">{t('userDetail.protocols')}</p>
+                        <p className="text-sm text-dark-200 mb-2">{t('userDetail.protocolCredentials')}</p>
                         <div className="grid grid-cols-1 gap-2">
                           {user.vless_uuid && (
                             <div className="bg-[var(--glass-bg)]/40 rounded-lg p-2.5">
-                              <p className="text-xs text-dark-300 mb-0.5">VLESS UUID</p>
+                              <p className="text-xs text-dark-300 mb-0.5">{t('userDetail.protocols.vless')}</p>
                               <p className="text-xs font-mono text-white break-all">{user.vless_uuid}</p>
                             </div>
                           )}
                           {user.trojan_password && (
                             <div className="bg-[var(--glass-bg)]/40 rounded-lg p-2.5">
-                              <p className="text-xs text-dark-300 mb-0.5">Trojan Password</p>
+                              <p className="text-xs text-dark-300 mb-0.5">{t('userDetail.protocols.trojan')}</p>
                               <p className="text-xs font-mono text-white break-all">{user.trojan_password}</p>
                             </div>
                           )}
                           {user.ss_password && (
                             <div className="bg-[var(--glass-bg)]/40 rounded-lg p-2.5">
-                              <p className="text-xs text-dark-300 mb-0.5">Shadowsocks Password</p>
+                              <p className="text-xs text-dark-300 mb-0.5">{t('userDetail.protocols.shadowsocks')}</p>
                               <p className="text-xs font-mono text-white break-all">{user.ss_password}</p>
                             </div>
                           )}
@@ -2297,7 +2492,7 @@ export default function UserDetail() {
                           <Badge variant={sevBadge.variant}>
                             {v.severity}
                           </Badge>
-                          <span className="text-white text-sm">Score: {v.score.toFixed(1)}</span>
+                          <span className="text-white text-sm">{t('userDetail.violations.score')}: {v.score.toFixed(1)}</span>
                           <span className="text-dark-200 text-sm">{v.recommended_action}</span>
                           {v.action_taken && (
                             <Badge variant="outline" className="text-[10px]">{v.action_taken}</Badge>
@@ -2313,8 +2508,9 @@ export default function UserDetail() {
                         </p>
                       )}
                       {v.admin_comment && (
-                        <p className="text-xs text-muted-foreground italic mt-1 line-clamp-1">
-                          💬 {v.admin_comment}
+                        <p className="text-xs text-muted-foreground italic mt-1 line-clamp-1 flex items-center gap-1">
+                          <MessageSquare className="w-3 h-3 shrink-0" />
+                          {v.admin_comment}
                         </p>
                       )}
                     </div>
@@ -2365,6 +2561,7 @@ export default function UserDetail() {
                           'flex-shrink-0',
                           copied && 'bg-green-600 hover:bg-green-500 text-white'
                         )}
+                        aria-label={t('common.copy')}
                       >
                         {copied ? (
                           <Check className="h-3.5 w-3.5" />
@@ -2401,6 +2598,7 @@ export default function UserDetail() {
                         <Network className="h-3.5 w-3.5" />
                         IPs
                       </Button>
+                      <ImportClientDropdown userUuid={user.uuid} />
                     </div>
                   </div>
                 ) : user.subscription_uuid ? (
@@ -2458,7 +2656,7 @@ export default function UserDetail() {
             <CardHeader>
               <CardTitle className="flex items-center gap-2">
                 <ShieldCheck className="h-5 w-5 text-primary-400" />
-                Anti-Abuse
+                {t('userDetail.antiAbuse.title')}
               </CardTitle>
             </CardHeader>
             <CardContent>
@@ -2549,6 +2747,51 @@ export default function UserDetail() {
         variant="destructive"
         onConfirm={() => { deleteMutation.mutate(); setShowDeleteConfirm(false) }}
       />
+
+      {/* Reset traffic confirm */}
+      <ConfirmDialog
+        open={resetTrafficConfirm}
+        onOpenChange={(o) => { if (!o) setResetTrafficConfirm(false) }}
+        title={t('userDetail.actions.resetTraffic')}
+        description={t('userDetail.resetTrafficConfirm', { defaultValue: 'Сбросить счётчик трафика текущего периода? Действие необратимо.' })}
+        confirmLabel={t('userDetail.actions.resetTraffic')}
+        variant="destructive"
+        onConfirm={() => { resetTrafficMutation.mutate(); setResetTrafficConfirm(false) }}
+      />
+
+      {/* Reassign user to another admin */}
+      <Dialog open={showReassignDialog} onOpenChange={setShowReassignDialog}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{t('userDetail.reassign.title')}</DialogTitle>
+            <DialogDescription>{t('userDetail.reassign.description')}</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4 py-4">
+            <Label>{t('userDetail.reassign.selectAdmin')}</Label>
+            <Select value={reassignAdminId} onValueChange={setReassignAdminId}>
+              <SelectTrigger>
+                <SelectValue placeholder={t('userDetail.reassign.selectAdmin')} />
+              </SelectTrigger>
+              <SelectContent>
+                {allAdmins.map((a) => (
+                  <SelectItem key={a.id} value={String(a.id)}>{a.username}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setShowReassignDialog(false)}>
+              {t('userDetail.actions.cancel')}
+            </Button>
+            <Button
+              onClick={() => { if (reassignAdminId) reassignMutation.mutate(Number(reassignAdminId)) }}
+              disabled={!reassignAdminId || reassignMutation.isPending}
+            >
+              {reassignMutation.isPending ? t('userDetail.reassign.saving') : t('userDetail.reassign.confirm')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* Revoke full subscription confirm */}
       <ConfirmDialog
@@ -2729,10 +2972,8 @@ export default function UserDetail() {
               <Button
                 variant="outline"
                 onClick={() => {
-                  if (uuid) client.delete(`/violations/whitelist/${uuid}`).then(() => {
-                    toast.success(t('violations.toast.whitelistRemoved'))
-                    setExclusionDialogOpen(false)
-                  }).catch(() => toast.error(t('common.error')))
+                  if (!uuid) return
+                  removeWhitelistMutation.mutate(uuid)
                 }}
               >
                 {t('violations.exclusions.removeWhitelist')}

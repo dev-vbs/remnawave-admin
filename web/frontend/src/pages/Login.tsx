@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState, useMemo, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
+import { useQuery } from '@tanstack/react-query'
 import { useAuthStore } from '../store/authStore'
 import { authApi, TelegramUser, AuthMethods } from '../api/auth'
+import client from '@/api/client'
 import {
   User,
   Lock,
@@ -17,7 +19,7 @@ import {
   Copy,
   Check,
   UserPlus,
-} from 'lucide-react'
+} from '@/components/brand/icons'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -292,6 +294,22 @@ export default function Login() {
   const { t } = useTranslation()
   const containerRef = useRef<HTMLDivElement>(null)
   const navigate = useNavigate()
+
+  const { data: brandData } = useQuery({
+    queryKey: ['public-brand'],
+    queryFn: async () => {
+      const { data } = await client.get('/settings/public-brand')
+      return data as { name: string }
+    },
+    staleTime: 300_000,
+    retry: 1,
+  })
+  const brand = brandData?.name || 'Remnawave Admin'
+  const isDefaultBrand = brand === 'Remnawave Admin'
+
+  useEffect(() => {
+    document.title = brand
+  }, [brand])
   const {
     login,
     loginWithPassword,
@@ -404,7 +422,14 @@ export default function Login() {
     }
 
     const script = document.createElement('script')
-    script.src = 'https://telegram.org/js/telegram-widget.js?22'
+    // Вендоренная копия https://telegram.org/js/telegram-widget.js?22 —
+    // защита от supply-chain атаки через CDN Telegram. ВАЖНО: оригинал
+    // выводит origin iframe из script.src, поэтому копия пропатчена
+    // (getWidgetsOrigin всегда возвращает https://oauth.telegram.org).
+    // Обновление: скачать новую версию в public/vendor/ и заново пропатчить.
+    // ?v= — cache-busting: при обновлении вендоренной копии поднять версию,
+    // иначе браузеры/прокси держат старый скрипт в кэше
+    script.src = '/vendor/telegram-widget.js?v=22.1'
     script.setAttribute('data-telegram-login', botUsername)
     script.setAttribute('data-size', 'large')
     script.setAttribute('data-radius', '8')
@@ -584,10 +609,21 @@ export default function Login() {
                 )}
               </div>
               <div className="text-center">
-                <h1 className="text-2xl font-display font-bold text-white tracking-tight">
-                  Remnawave
-                </h1>
-                <p className="text-sm text-dark-200 mt-1">
+                {isDefaultBrand ? (
+                  <>
+                    <h1 className="text-2xl font-display font-bold text-white tracking-tight">
+                      Remnawave
+                    </h1>
+                    <div className="text-[11px] font-semibold uppercase tracking-[0.4em] text-[#22d3ee] mt-1.5 ml-[0.4em]">
+                      Admin
+                    </div>
+                  </>
+                ) : (
+                  <h1 className="text-2xl font-display font-bold text-white tracking-tight">
+                    {brand}
+                  </h1>
+                )}
+                <p className="text-sm text-dark-200 mt-2">
                   {needsSetup ? t('login.initialSetup') : t('login.subtitle')}
                 </p>
               </div>

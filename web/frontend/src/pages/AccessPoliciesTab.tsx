@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
-import { Plus, Trash2, Shield, Users, Save } from 'lucide-react'
+import { Plus, Trash2, Shield, Users, Save } from '@/components/brand/icons'
 import {
   accessPoliciesApi,
   type PolicyDetail,
@@ -486,7 +486,7 @@ function PolicyEditor({
                     </div>
                   </div>
                   <div className="col-span-2 md:col-span-1 pt-5">
-                    <Button size="sm" variant="ghost" onClick={() => removeRule(i)}>
+                    <Button size="sm" variant="ghost" onClick={() => removeRule(i)} aria-label={t('common.delete')}>
                       <Trash2 className="w-4 h-4" />
                     </Button>
                   </div>
